@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "gpt-oauth": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["${pluginDir}/server/server.js"]
+    }
+  }
+}
