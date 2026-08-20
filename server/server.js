@@ -25,7 +25,7 @@ const os = require('os');
 const { spawn } = require('child_process');
 const readline = require('readline');
 
-const VERSION = '0.1.0';
+const VERSION = '0.1.1';
 const NAME = 'gpt-oauth';
 
 // ---------------------------------------------------------------------------
@@ -34,6 +34,11 @@ const NAME = 'gpt-oauth';
 const CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
 const AUTH_BASE = 'https://auth.openai.com/oauth';
 const BACKEND_BASE = 'https://chatgpt.com/backend-api/codex';
+
+// OAuth flow matching the Codex CLI (opencode-openai-codex-auth).
+const REDIRECT_PATH = '/auth/callback';
+const REDIRECT_HOST = 'localhost';
+const SCOPE = 'openid profile email offline_access';
 
 const ZCODE_DIR = path.join(os.homedir(), '.zcode');
 const TOKEN_DIR = path.join(ZCODE_DIR, 'gpt-oauth');
@@ -258,14 +263,21 @@ async function getAccess() {
 // ---------------------------------------------------------------------------
 // Account id + email resolution
 // ---------------------------------------------------------------------------
-function decodeEmailFromIdToken(idToken) {
-  if (!idToken) return null;
+// Decode the id_token JWT payload -> { email, accountId }.
+// accountId comes from payload["https://api.openai.com/auth"].chatgpt_account_id.
+function decodeIdToken(idToken) {
+  const out = { email: null, accountId: null };
+  if (!idToken) return out;
   try {
     const parts = idToken.split('.');
-    if (parts.length < 2) return null;
+    if (parts.length < 2) return out;
     const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
-    return payload && typeof payload.email === 'string' ? payload.email : null;
-  } catch (e) { return null; }
+    if (payload && typeof payload.email === 'string') out.email = payload.email;
+    if (payload && payload['https://api.openai.com/auth'] && payload['https://api.openai.com/auth'].chatgpt_account_id) {
+      out.accountId = String(payload['https://api.openai.com/auth'].chatgpt_account_id);
+    }
+  } catch (e) { /* ignore */ }
+  return out;
 }
 
 async function resolveAccount(store) {
@@ -345,21 +357,24 @@ async function oauthLogin() {
         }
       });
       server.listen(port, '127.0.0.1', () => {
-        log('OAuth callback listening on http://localhost:' + port + '/auth');
+        log('OAuth callback listening on http://localhost:' + port + REDIRECT_PATH);
         startFlow(server, port);
       });
     }
 
     async function startFlow(server, port) {
-      const redirectUri = `http://localhost:${port}/auth`;
+      const redirectUri = `http://${REDIRECT_HOST}:${port}${REDIRECT_PATH}`;
       const authorizeUrl = `${AUTH_BASE}/authorize?` + new URLSearchParams({
         client_id: CLIENT_ID,
         response_type: 'code',
         redirect_uri: redirectUri,
-        scope: 'offline_access model.request model.read',
+        scope: SCOPE,
         code_challenge_method: 'S256',
         code_challenge: challenge,
         state: state,
+        id_token_add_organizations: 'true',
+        codex_cli_simplified_flow: 'true',
+        originator: 'codex_cli_rs',
       });
 
       let code = null;
@@ -371,7 +386,7 @@ async function oauthLogin() {
 
       server.on('request', (req, res) => {
         const u = new URL(req.url, 'http://localhost');
-        if (u.pathname !== '/auth') {
+        if (u.pathname !== REDIRECT_PATH) {
           res.writeHead(404); res.end('not found'); return;
         }
         gotState = u.searchParams.get('state');
@@ -405,17 +420,23 @@ async function oauthLogin() {
               return;
             }
             const t = JSON.parse(token.body);
+            const idTokenInfo = decodeIdToken(t.id_token);
             const store = {
               access: t.access_token,
               refresh: t.refresh_token,
               expires: Date.now() + (t.expires_in ? t.expires_in * 1000 : 0),
-              accountId: null,
-              email: decodeEmailFromIdToken(t.id_token),
+              accountId: idTokenInfo.accountId,
+              email: idTokenInfo.email,
               savedAt: Date.now(),
             };
             saveStore(store);
+            // Fall back to the codex accounts endpoint if id_token lacked accountId.
             let accountErr = null;
-            try { await resolveAccount(store); } catch (e) { accountErr = e.message; }
+            if (!store.accountId) {
+              try { await resolveAccount(store); } catch (e) { accountErr = e.message; }
+            } else {
+              log('Resolved accountId from id_token (chatgpt_account_id)');
+            }
             const final = loadStore();
             resolve({ email: final.email, accountId: final.accountId, expires: final.expires, accountError: accountErr });
           } catch (e) {
