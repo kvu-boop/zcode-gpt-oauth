@@ -1,0 +1,14 @@
+{
+  "name": "zcode-gpt-oauth",
+  "description": "ZCode plugin: ChatGPT (GPT Plus) OAuth login and OpenAI-compatible local proxy — use GPT models in subagents without an API key",
+  "owner": { "name": "KhanhVu", "email": "k.vu0123@gmail.com" },
+  "plugins": [
+    {
+      "name": "gpt-oauth",
+      "source": "./",
+      "description": "ChatGPT (GPT Plus) OAuth login and OpenAI-compatible local proxy for ZCode",
+      "version": "0.1.0",
+      "author": { "name": "KhanhVu" }
+    }
+  ]
+}
