@@ -25,7 +25,7 @@ const os = require('os');
 const { spawn } = require('child_process');
 const readline = require('readline');
 
-const VERSION = '0.1.1';
+const VERSION = '0.1.5';
 const NAME = 'gpt-oauth';
 
 // ---------------------------------------------------------------------------
@@ -547,14 +547,17 @@ function startMCP() {
             {
               name: 'gpt_login',
               description: 'Open browser to log in to ChatGPT (GPT Plus) via OAuth. Waits up to 5 minutes. Returns {email, accountId, expires}.',
+              inputSchema: { type: 'object', properties: {}, required: [] },
             },
             {
               name: 'gpt_logout',
               description: 'Delete the stored OAuth token (forces re-login).',
+              inputSchema: { type: 'object', properties: {}, required: [] },
             },
             {
               name: 'gpt_status',
               description: 'Return login status, token expiry, proxy status and last error.',
+              inputSchema: { type: 'object', properties: {}, required: [] },
             },
           ],
         },
