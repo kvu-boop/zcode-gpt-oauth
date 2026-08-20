@@ -9,9 +9,13 @@ The plugin contains a single Node process (zero dependencies, Node >= 18) that r
 
 ## Install
 
-1. Open ZCode → **Settings → Plugin Management → Discover → +** → choose **local directory**.
-2. Select `~/zcode-plugins/gpt-oauth`.
+**From the marketplace (recommended):**
+
+1. Open ZCode → **Settings → Plugin Management → Discover → +** → paste the GitHub URL `https://github.com/kvu-boop/zcode-gpt-oauth`.
+2. The **gpt-oauth** plugin card appears → click **Get**.
 3. Enable the plugin so its MCP server starts.
+
+**Fallback — local directory install** (still works): Discover → + → choose **local directory** → select `~/zcode-plugins/gpt-oauth`. This is useful when running from a local checkout.
 
 > Note on `.mcp.json`: we use the `"${pluginDir}/server/server.js"` interpolation form (the proven format used by the context7 plugin). If your ZCode version does not interpolate `${pluginDir}`, change the args to the relative path `"server/server.js"` since the plugin cache runs from the plugin root.
 
