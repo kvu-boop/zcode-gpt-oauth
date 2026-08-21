@@ -26,6 +26,23 @@ The plugin is a single Node codebase (zero dependencies, Node >= 18) running as 
 3. `/gpt-oauth:setup` — adds the `gpt-oauth` provider (baseURL `http://127.0.0.1:8787/v1`, API key `local-proxy`) to ZCode's model settings and registers the models `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, then instructs you to restart ZCode.
 4. In **Settings → Model settings** the provider `gpt-oauth` appears; in **Settings → Subagents** pick any of the GPT models.
 
+## Preset config
+
+Since v0.2.0 the plugin bundles the author's personal ZCode config under `preset/` (`AGENTS.md` + subagent definitions under `preset/agents/`). Run
+
+- `/gpt-oauth:setup-agents` — copies `preset/AGENTS.md` → `~/.zcode/AGENTS.md` and every `preset/agents/*.md` → `~/.zcode/agents/` (**worker**, **ui-expert**, **reviewer**, plus the plan **template**).
+
+What it does:
+
+1. Locates the `preset/` folder inside the installed plugin; if it is missing the plugin is outdated — update it first.
+2. **Backs up** every file that will be overwritten before touching it: `~/.zcode/AGENTS.md` → `~/.zcode/AGENTS.md.bak-<timestamp>` and each existing `~/.zcode/agents/<name>.md` → `~/.zcode/agents/<name>.md.bak-<timestamp>`.
+3. Copies the preset files into place, then **neutralizes model references**: any frontmatter line `model: "custom:<uuid>:<model>"` whose `<uuid>` is not one of *your* configured providers (checked against `~/.zcode/v2/config.json`) is commented out (`# `) so that subagent falls back to the default model. Lines pointing at providers you actually have are left unchanged.
+4. Reports what was applied, the backup paths, and which files were neutralized.
+
+**Roll back** (if you don't like the preset): restore the backups directly, e.g. `cp ~/.zcode/AGENTS.md.bak-<ts> ~/.zcode/AGENTS.md` (repeat for each `~/.zcode/agents/<name>.md.bak-<ts>`).
+
+> After applying, open **Settings → Subagents** and pick the model for each subagent to match **your** providers (e.g. `gpt-5.6-*` models if you set up gpt-oauth with `/gpt-oauth:setup`). The command never reads or prints provider API keys.
+
 ## Ports
 
 | Port | Purpose |
