@@ -93,9 +93,28 @@ Windows requires Node.js to be available in `PATH`. The plugin opens the default
 
 ## Troubleshooting
 
-### Known limitation: streaming is buffered
+### Streaming (since v0.2.2)
 
-Streaming responses (`stream: true`) are emitted after the upstream model completes, **not token-by-token**. The proxy aggregates the backend SSE then re-emits standardized `chat.completion.chunk` events, so you get the same structured chunks but no incremental token streaming.
+Streaming responses (`stream: true`) are forwarded **incrementally and token-by-token** from the Codex backend to the client:
+
+- Client `text/event-stream` headers are written immediately (and flushed) before the upstream is even contacted, and a `role` chunk is emitted first.
+- Each upstream `response.output_text.delta` is converted to a standard `chat.completion.chunk` and written **as soon as it arrives**; tool-call items are emitted in valid Chat Completions chunk format, followed by `finish_reason`, `usage` (when the backend reports it) and a final `data: [DONE]`.
+- A `: keep-alive` SSE comment is sent every 10&nbsp;s while the upstream is active, so OpenAI-compatible clients never idle-timeout into long "Reconnecting..." waits during long generations.
+- Upstream failures are bounded and explicit: a JSON error is returned if the failure happens before client headers; after headers the client gets an SSE error chunk followed by `data: [DONE]`. Response headers must arrive within 45&nbsp;s (otherwise 504), and the upstream must keep sending data at least every 45&nbsp;s or the stream terminates cleanly.
+
+The old v0.2.1 behavior buffered the whole upstream body and only re-emitted chunks after the model finished — that looked like a hang to clients and caused the long "Reconnecting..." waits after idle.
+
+### Streaming diagnostics
+
+Each streaming request is tracked with concise lines in `~/.zcode/gpt-oauth/daemon.log` (or stderr in non-daemon mode):
+
+```
+POST /v1/chat/completions stream model=gpt-5.6-sol start
+POST /v1/chat/completions stream model=gpt-5.6-sol upstream headers 200 (312ms)
+POST /v1/chat/completions stream model=gpt-5.6-sol done 6421ms upstream_headers=312ms first_event=359ms events=38 chunks=40
+```
+
+A short `first_event` vs `done` proves the client saw data long before the upstream finished. Timeouts/errors appear as `ERROR status=504/502 ...` with the reason (`upstream headers timeout` / `upstream idle timeout`).
 
 ### Other issues
 

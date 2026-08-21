@@ -32,7 +32,7 @@ $PRESET = Join-Path $latest.FullName 'preset'
 $PRESET
 ```
 
-The glob / directory listing covers any installed release (e.g. `gpt-oauth/0.2.1/preset/`); if multiple versions are installed, prefer the newest (sorted → last entry). Keep `$PRESET` for the next steps.
+The glob / directory listing covers any installed release (e.g. `gpt-oauth/0.2.2/preset/`); if multiple versions are installed, prefer the newest (sorted → last entry). Keep `$PRESET` for the next steps.
 
 **If no `preset/` directory is found**: the user has an outdated plugin — tell them to update the plugin (Settings → Plugin Management → update gpt-oauth, then restart ZCode) and **STOP**.
 

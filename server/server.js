@@ -31,7 +31,7 @@ const os = require('os');
 const { spawn } = require('child_process');
 const readline = require('readline');
 
-const VERSION = '0.2.1';
+const VERSION = '0.2.2';
 const NAME = 'gpt-oauth';
 
 // ---------------------------------------------------------------------------
@@ -51,7 +51,9 @@ process.on('unhandledRejection', (reason) => {
 // ---------------------------------------------------------------------------
 const CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
 const AUTH_BASE = 'https://auth.openai.com/oauth';
-const BACKEND_BASE = 'https://chatgpt.com/backend-api/codex';
+// Overridable so the SSE/streaming tests can point the proxy at a local
+// slow-upstream harness. Default is the production Codex backend.
+const BACKEND_BASE = process.env.GPT_OAUTH_BACKEND_BASE || 'https://chatgpt.com/backend-api/codex';
 
 // OAuth flow matching the Codex CLI (opencode-openai-codex-auth).
 const REDIRECT_PATH = '/auth/callback';
@@ -70,6 +72,11 @@ const OAUTH_MAX_WAIT_MS = 5 * 60 * 1000;
 
 const MODEL_IDS = ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'];
 const MODEL_OWNED_BY = 'chatgpt-oauth';
+
+// Streaming (v0.2.2): bounds for the incremental SSE forwarder.
+const STREAM_HEADERS_TIMEOUT_MS = 45000;  // upstream response headers must arrive within this
+const STREAM_IDLE_TIMEOUT_MS = 45000;     // upstream must send data this often once headers arrive
+const STREAM_HEARTBEAT_MS = 10000;        // client-side `: keep-alive` SSE comment while streaming
 
 // Which parts of the server run.
 const args = process.argv.slice(2);
@@ -953,6 +960,69 @@ function parseSSE(body) {
   return events;
 }
 
+// Stateful incremental SSE parser used by the streaming forwarder. Handles TCP
+// splits (partial blocks arriving across `data` events), LF/CRLF line endings,
+// multi-line `data:` fields, `event:` names, non-JSON/comment lines and the
+// `[DONE]` sentinel WITHOUT buffering the entire upstream body.
+function createSSEParser(onEvent, onDone) {
+  let buffer = '';
+  function emitBlock(block) {
+    let data = null;
+    for (const line of block.split('\n')) {
+      if (line.startsWith('data:')) {
+        const piece = line.slice(5).replace(/^ /, '');
+        data = data === null ? piece : data + '\n' + piece;
+      }
+    }
+    if (data === null) return;
+    const trimmed = data.trim();
+    if (!trimmed) return;
+    if (trimmed === '[DONE]') {
+      if (onDone) onDone();
+      return;
+    }
+    try { onEvent(JSON.parse(trimmed)); } catch (e) { /* skip non-JSON */ }
+  }
+  return {
+    push(chunk) {
+      buffer += String(chunk);
+      buffer = buffer.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+      let idx;
+      while ((idx = buffer.indexOf('\n\n')) !== -1) {
+        const block = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        emitBlock(block);
+      }
+    },
+    flush() {
+      if (buffer.trim().length) {
+        const block = buffer;
+        buffer = '';
+        emitBlock(block);
+      }
+    },
+  };
+}
+
+// Best-effort extraction of a human-readable message from an upstream error
+// body ({error:{message}} / {message} / plain text). Never logs tokens.
+function extractUpstreamError(status, body) {
+  let msg = '';
+  try {
+    const j = JSON.parse(body);
+    if (j && j.error) {
+      if (typeof j.error === 'string') msg = j.error;
+      else if (j.error.message) msg = String(j.error.message);
+    } else if (j && typeof j.message === 'string') {
+      msg = j.message;
+    }
+  } catch (e) { /* non-JSON body */ }
+  if (!msg) msg = String(body || '').slice(0, 300).trim();
+  if (!msg) msg = 'upstream error ' + status;
+  if (status === 404) msg = 'model not found on backend: ' + msg;
+  return msg.slice(0, 500);
+}
+
 function postBackend(store, body, retry = true) {
   return new Promise((resolve, reject) => {
     const u = new URL(`${BACKEND_BASE}/responses`);
@@ -1010,6 +1080,116 @@ function postBackend(store, body, retry = true) {
     // remains in force for the response body after that.
     req.on('response', () => clearTimeout(headersTimer));
   });
+}
+
+// Incremental upstream response streaming (v0.2.2). POSTs the Responses request
+// and hands every SSE chunk to handlers.onData as it arrives — nothing is
+// buffered. Terminal outcomes:
+//   - 2xx:  handlers.onStatus(status) then onData/onEnd
+//   - 401 (first attempt): refresh the access token and retry once, notifying
+//     handlers.onRetry401
+//   - other non-2xx: reads the (bounded) error body, ends with handlers.onError
+//   - headers timeout (SOCKS/TLS/HTTP headers not received in 45s): 504 error
+//   - idle-data timeout (no upstream data for 45s after headers): 502 error
+// handlers: { onStatus, onData, onEnd, onRetry401, onError }
+function upstreamStream(store, body, handlers) {
+  let req = null;
+  let attempt = 0;
+  let settled = false;
+
+  function fail(err) {
+    if (settled) return;
+    settled = true;
+    handlers.onError(err);
+    try { if (req) req.destroy(); } catch (e) { /* ignore */ }
+  }
+
+  function start(tok) {
+    if (!tok) { fail(Object.assign(new Error('re-login required (no token)'), { upstreamStatus: 401 })); return; }
+    const u = new URL(`${BACKEND_BASE}/responses`);
+    const json = JSON.stringify(body);
+    const headers = {
+      'Authorization': 'Bearer ' + tok.access,
+      'Content-Type': 'application/json',
+      'Accept': 'text/event-stream',
+      'User-Agent': 'codex_cli_rs/0.42.0 (macOS 15.2; arm64)',
+      'originator': 'codex_cli_rs',
+      'OpenAI-Beta': 'responses=experimental',
+    };
+    if (tok.accountId) headers['chatgpt-account-id'] = tok.accountId;
+    const mod = driverFor(u);
+
+    // Headers timeout: 45s from connection attempt until response headers.
+    const headersTimer = setTimeout(() => {
+      const e = new Error('upstream headers timeout (no response after 45s)');
+      e.upstreamStatus = 504;
+      fail(e);
+    }, STREAM_HEADERS_TIMEOUT_MS);
+    if (headersTimer.unref) headersTimer.unref();
+
+    req = mod.request({
+      hostname: u.hostname, port: u.port || (u.protocol === 'https:' ? 443 : 80), path: u.pathname + u.search,
+      method: 'POST', headers,
+    }, (res) => {
+      try { clearTimeout(headersTimer); } catch (e) { /* ignore */ }
+      if (res.statusCode === 401 && attempt === 0) {
+        // Drain the small 401 body, then refresh once and retry.
+        attempt++;
+        res.resume();
+        res.on('end', () => {
+          handlers.onRetry401();
+          refreshAccess(tok).then(() => {
+            if (settled) return;
+            start(loadStore());
+          }).catch((e) => fail(e));
+        });
+        return;
+      }
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        // Read a bounded error body then fail terminally (client already has
+        // SSE headers; the caller turns this into an SSE error + [DONE]).
+        let buf = '';
+        res.on('data', (c) => { if (buf.length < 8192) buf += c; });
+        res.on('end', () => {
+          const e = new Error(extractUpstreamError(res.statusCode, buf));
+          e.upstreamStatus = res.statusCode;
+          fail(e);
+        });
+        res.on('error', () => fail(new Error('upstream error ' + res.statusCode)));
+        return;
+      }
+      handlers.onStatus(res.statusCode);
+      // Idle-data timeout: reset on every chunk, abort if upstream stalls.
+      const idle = setTimeout(() => {
+        const e = new Error('upstream idle timeout (no data after 45s)');
+        e.upstreamStatus = 502;
+        fail(e);
+      }, STREAM_IDLE_TIMEOUT_MS);
+      if (idle.unref) idle.unref();
+      const resetIdle = () => { try { idle.refresh(); } catch (e) { /* ignore */ } };
+      res.on('data', (c) => { resetIdle(); handlers.onData(c); });
+      res.on('end', () => {
+        try { clearTimeout(idle); } catch (e) { /* ignore */ }
+        if (!settled) { settled = true; handlers.onEnd(); }
+      });
+      res.on('error', (e) => {
+        try { clearTimeout(idle); } catch (x) { /* ignore */ }
+        fail(e && e.message ? e : new Error('upstream response error'));
+      });
+    });
+    req.on('error', (e) => {
+      if (settled) return; // timeout path already handled it
+      settled = true;
+      handlers.onError(e && e.message ? e : new Error('upstream request failed'));
+    });
+    req.write(json);
+    req.end();
+  }
+
+  start(store);
+  return {
+    abort() { settled = true; try { if (req) req.destroy(); } catch (e) { /* ignore */ } },
+  };
 }
 
 // Transform a chat.completions request into codex response events / final obj.
@@ -1110,20 +1290,25 @@ function nonStreamReply(agg) {
   };
 }
 
-function chunkObj(agg, delta, finish) {
-  const chunk = {
-    id: 'chatcmpl-' + crypto.randomBytes(8).toString('hex'),
-    object: 'chat.completion.chunk',
-    created: agg.created,
-    model: agg.model,
-    choices: [{ index: 0, delta, finish_reason: finish === undefined ? null : finish }],
-  };
-  return chunk;
-}
-
-// We aggregate the backend SSE and re-emit standardized chunks to the client.
+// ---------------------------------------------------------------------------
+// Streaming (v0.2.2): incremental forwarder.
+//
+// Client SSE headers are written immediately (flushHeaders), a `role` chunk is
+// emitted, and each upstream Responses event is converted to a standard
+// `chat.completion.chunk` as it arrives — nothing is buffered until the
+// upstream completes. A `: keep-alive` SSE comment is sent every 10s while the
+// upstream is active so OpenAI-compatible clients never idle-timeout on long
+// generations. Upstream failures behave terminally: JSON before client headers,
+// SSE error + `data: [DONE]` after them.
+// ---------------------------------------------------------------------------
 async function handleStream(clientRes, clientBody) {
   const start = process.hrtime.bigint();
+  const startedAt = Date.now();
+  const model = clientBody.model;
+  const created = Math.floor(Date.now() / 1000);
+  const chunkId = 'chatcmpl-' + crypto.randomBytes(8).toString('hex');
+  const nowMs = () => Date.now() - startedAt;
+
   // Build/validate the request payload FIRST so client-input errors (e.g.
   // image input -> HTTP 400) are returned as a real JSON error before any
   // SSE headers are written.
@@ -1136,34 +1321,198 @@ async function handleStream(clientRes, clientBody) {
     const status = e.upstreamStatus || (e.code === 400 ? 400 : 502);
     clientRes.writeHead(status, { 'Content-Type': 'application/json' });
     clientRes.end(JSON.stringify({ error: { message: e.message, type: 'gpt_oauth_error' } }));
-    log(`POST /v1/chat/completions stream model=${clientBody.model} ERROR ${status} pre-stream`);
+    log(`POST /v1/chat/completions stream model=${model} ERROR ${status} pre-stream`);
     return;
   }
+  log(`POST /v1/chat/completions stream model=${model} start`);
 
+  const state = {
+    clientHeadersSent: false,
+    upstreamStatus: null,
+    upstreamHeadersMs: null,
+    firstEventMs: null,
+    chunks: 0,
+    events: 0,
+    toolOrder: [],        // function_call call_ids in arrival order
+    toolIndex: new Map(), // call_id -> chunk index
+    toolArgs: new Map(),  // call_id -> accumulated arguments
+    toolArgsStreamed: new Set(), // call_ids whose args arrived as deltas
+    usage: null,
+    finished: false,
+  };
+  let heartbeat = null;
+  let upstream = null;
+  let clientClosed = false;
+
+  const send = (s) => {
+    if (clientClosed || state.finished) return;
+    try { clientRes.write(s); } catch (e) { /* ignore write-after-close */ }
+  };
+  const stopHeartbeat = () => { if (heartbeat) { clearInterval(heartbeat); heartbeat = null; } };
+
+  const emitChunk = (delta, finish, extra) => {
+    if (state.finished || !state.clientHeadersSent) return;
+    const chunk = {
+      id: chunkId,
+      object: 'chat.completion.chunk',
+      created,
+      model,
+      choices: [{ index: 0, delta, finish_reason: finish === undefined ? null : finish }],
+    };
+    if (extra) Object.assign(chunk, extra);
+    state.chunks++;
+    send('data: ' + JSON.stringify(chunk) + '\n\n');
+  };
+
+  const finish = (ok, err) => {
+    if (state.finished) return;
+    state.finished = true;
+    stopHeartbeat();
+    if (upstream) { try { upstream.abort(); } catch (e) { /* ignore */ } upstream = null; }
+    const durMs = Math.round(Number(process.hrtime.bigint() - start) / 1e6);
+    if (ok) {
+      log(`POST /v1/chat/completions stream model=${model} done ${durMs}ms upstream_headers=${state.upstreamHeadersMs === null ? '-' : state.upstreamHeadersMs}ms first_event=${state.firstEventMs === null ? '-' : state.firstEventMs}ms events=${state.events} chunks=${state.chunks}`);
+    } else {
+      const status = err && err.upstreamStatus ? ' status=' + err.upstreamStatus : '';
+      log(`POST /v1/chat/completions stream model=${model} ERROR${status} ${durMs}ms events=${state.events} chunks=${state.chunks}: ${err && err.message ? err.message : err}`);
+      global.lastError = err && err.message ? err.message : String(err);
+    }
+    try { state.finished = true; clientRes.end(); } catch (e) { /* ignore */ }
+  };
+
+  const completeStream = () => {
+    if (state.finished) return;
+    const hasToolCalls = state.toolOrder.length > 0;
+    let usage;
+    if (state.usage) {
+      usage = {
+        prompt_tokens: state.usage.input_tokens || 0,
+        completion_tokens: state.usage.output_tokens || 0,
+        total_tokens: (state.usage.input_tokens || 0) + (state.usage.output_tokens || 0),
+      };
+    }
+    emitChunk({}, hasToolCalls ? 'tool_calls' : 'stop', usage ? { usage } : undefined);
+    if (!state.finished) send('data: [DONE]\n\n');
+    finish(true);
+  };
+
+  const failStream = (err) => {
+    if (state.finished) return;
+    const msg = String(err && err.message ? err.message : err || 'stream error').replace(/[\r\n]+/g, ' ').slice(0, 500);
+    if (!state.clientHeadersSent) {
+      const status = (err && err.upstreamStatus) || (err && err.code === 400 ? 400 : 502);
+      try {
+        clientRes.writeHead(status, { 'Content-Type': 'application/json' });
+        clientRes.end(JSON.stringify({ error: { message: msg, type: 'gpt_oauth_error' } }));
+      } catch (e) { /* ignore */ }
+      finish(false, err);
+      return;
+    }
+    send('data: ' + JSON.stringify({ error: { message: msg, type: 'gpt_oauth_error' } }) + '\n\n');
+    if (!state.finished) send('data: [DONE]\n\n');
+    finish(false, err);
+  };
+
+  // Convert upstream Responses events into standard chat.completion.chunks.
+  function onUpstreamEvent(ev) {
+    if (state.finished) return;
+    if (state.firstEventMs === null) state.firstEventMs = nowMs();
+    state.events++;
+    const type = ev.type;
+    if (type === 'response.output_text.delta') {
+      if (typeof ev.delta === 'string' && ev.delta.length) emitChunk({ content: ev.delta });
+    } else if (type === 'response.output_item.added') {
+      const item = ev.item;
+      if (item && item.type === 'function_call') {
+        const index = state.toolOrder.length;
+        state.toolOrder.push(item.call_id);
+        state.toolIndex.set(item.call_id, index);
+        state.toolArgs.set(item.call_id, '');
+        if (item.name) {
+          emitChunk({ tool_calls: [{ index, id: item.call_id, type: 'function', function: { name: item.name, arguments: '' } }] });
+        }
+      }
+    } else if (type === 'response.function_call_arguments.delta') {
+      const callId = ev.item && ev.item.call_id;
+      const delta = typeof ev.delta === 'string' ? ev.delta : '';
+      if (callId && state.toolIndex.has(callId)) {
+        const index = state.toolIndex.get(callId);
+        state.toolArgs.set(callId, (state.toolArgs.get(callId) || '') + delta);
+        state.toolArgsStreamed.add(callId);
+        if (delta.length) emitChunk({ tool_calls: [{ index, function: { arguments: delta } }] });
+      }
+    } else if (type === 'response.output_item.done') {
+      const item = ev.item;
+      if (item && item.type === 'function_call') {
+        const args = typeof item.arguments === 'string' ? item.arguments : (item.arguments ? JSON.stringify(item.arguments) : '{}');
+        if (state.toolIndex.has(item.call_id)) {
+          state.toolArgs.set(item.call_id, args);
+          // Only replay the full arguments if we did not already stream them
+          // as `function_call_arguments` deltas (the deltas concatenate).
+          if (!state.toolArgsStreamed.has(item.call_id)) {
+            emitChunk({ tool_calls: [{ index: state.toolIndex.get(item.call_id), function: { arguments: args } }] });
+          }
+        } else {
+          // No `output_item.added` seen: emit the complete tool-call chunk here.
+          const index = state.toolOrder.length;
+          state.toolOrder.push(item.call_id);
+          state.toolIndex.set(item.call_id, index);
+          emitChunk({ tool_calls: [{ index, id: item.call_id, type: 'function', function: { name: item.name || '', arguments: args } }] });
+        }
+      }
+    } else if (type === 'response.completed') {
+      const r = ev.response;
+      if (r && r.usage) state.usage = r.usage;
+      completeStream();
+    } else if (type === 'response.failed' || type === 'response.error' || type === 'error') {
+      const msg = (typeof ev.message === 'string' && ev.message) || (ev.error && (ev.error.message || String(ev.error))) || (ev.code ? ev.code + ': backend error' : 'backend error');
+      const e = new Error(String(msg));
+      e.upstreamStatus = 502;
+      failStream(e);
+    }
+    // Other events (response.created, response.in_progress, response.output_item.done
+    // for messages, response.output_text.done, ...) are intentionally ignored.
+  }
+
+  // SSE headers first, flushed immediately so the client sees the stream.
   clientRes.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
     'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
   });
-  const write = (chunk) => clientRes.write('data: ' + JSON.stringify(chunk) + '\n\n');
-  try {
-    const res = await postBackend(store, backendBody);
-    const agg = transformEvents(parseSSE(res.body), clientBody);
-    write(chunkObj(agg, { role: 'assistant' }));
-    if (agg.text.length) write(chunkObj(agg, { content: agg.text }));
-    if (agg.hasToolCalls) {
-      agg.toolCalls.forEach((tc, i) => {
-        write(chunkObj(agg, { tool_calls: [{ index: i, id: tc.id, type: 'function', function: { name: tc.name, arguments: tc.arguments } }] }));
-      });
-    }
-    write(chunkObj(agg, {}, agg.hasToolCalls ? 'tool_calls' : 'stop'));
-    clientRes.write('data: [DONE]\n\n');
-    clientRes.end();
-  } catch (e) {
-    clientRes.end(`data: {"error":"${String(e.message || e).replace(/"/g, '')}"}\n\ndata: [DONE]\n\n`);
-  }
-  const dur = Number(process.hrtime.bigint() - start) / 1e6;
-  log(`POST /v1/chat/completions stream model=${clientBody.model} ${Math.round(dur)}ms`);
+  if (typeof clientRes.flushHeaders === 'function') clientRes.flushHeaders();
+  state.clientHeadersSent = true;
+
+  // First chunk carries the assistant role, per the Chat Completions convention.
+  emitChunk({ role: 'assistant' });
+
+  // Client heartbeat while the upstream request is active.
+  heartbeat = setInterval(() => { send(': keep-alive\n\n'); }, STREAM_HEARTBEAT_MS);
+  if (heartbeat.unref) heartbeat.unref();
+
+  clientRes.on('close', () => {
+    clientClosed = true;
+    stopHeartbeat();
+    if (upstream) { try { upstream.abort(); } catch (e) { /* ignore */ } upstream = null; }
+  });
+
+  // Incremental upstream SSE -> converted chunks.
+  const parser = createSSEParser(onUpstreamEvent, () => { if (!state.finished) completeStream(); });
+  upstream = upstreamStream(store, backendBody, {
+    onStatus: (status) => {
+      state.upstreamStatus = status;
+      state.upstreamHeadersMs = nowMs();
+      log(`POST /v1/chat/completions stream model=${model} upstream headers ${status} (${state.upstreamHeadersMs}ms)`);
+    },
+    onData: (chunk) => parser.push(chunk),
+    onEnd: () => {
+      parser.flush();
+      if (!state.finished) completeStream();
+    },
+    onRetry401: () => log(`POST /v1/chat/completions stream model=${model} upstream 401 -> refresh & retry`),
+    onError: (err) => failStream(err),
+  });
 }
 
 // ---------------------------------------------------------------------------
