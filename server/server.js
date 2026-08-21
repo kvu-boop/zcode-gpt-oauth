@@ -11,8 +11,14 @@
  * to stderr. Tokens are NEVER logged.
  *
  * CLI flags:
- *   --http-only   run proxy only (skip MCP stdio)   [used for curl tests]
- *   --mcp-only    run MCP stdio only (skip HTTP)
+ *   --daemon      detached HTTP-proxy-only process; logs to
+ *                 ~/.zcode/gpt-oauth/daemon.log. This is the canonical
+ *                 always-on form that owns port 8787 independent of MCP
+ *                 sessions (spawned by ensureDaemon()).
+ *   --http-only   in-process proxy only (skip MCP stdio) [used for curl tests]
+ *   --mcp-only    run MCP stdio only (skip HTTP). Deliberately does NOT spawn
+ *                 or ensure the daemon, so MCP-focused tests have no side
+ *                 effects on port 8787.
  */
 'use strict';
 
@@ -25,7 +31,7 @@ const os = require('os');
 const { spawn } = require('child_process');
 const readline = require('readline');
 
-const VERSION = '0.1.8';
+const VERSION = '0.1.9';
 const NAME = 'gpt-oauth';
 
 // ---------------------------------------------------------------------------
@@ -69,14 +75,66 @@ const MODEL_OWNED_BY = 'chatgpt-oauth';
 const args = process.argv.slice(2);
 const HTTP_ONLY = args.includes('--http-only');
 const MCP_ONLY = args.includes('--mcp-only');
-const RUN_MCP = !HTTP_ONLY;
-const RUN_HTTP = !MCP_ONLY;
+const DAEMON = args.includes('--daemon');
+// --daemon:       detached HTTP-proxy-only process, logs to daemon.log.
+//                 It is the canonical always-on owner of port 8787.
+// --http-only:    in-process (foreground) proxy for ad-hoc curl tests.
+// --mcp-only:     MCP stdio only; intentionally does NOT spawn/ensure the
+//                 daemon, so MCP-focused tests have no side effects on the port.
+const RUN_MCP = !HTTP_ONLY && !DAEMON;                    // serve MCP stdio
+const RUN_HTTP = !MCP_ONLY && (DAEMON || HTTP_ONLY);      // bind port 8787
 
 // ---------------------------------------------------------------------------
-// Logging (stderr only)
+// Logging (stderr, except in --daemon mode where it goes to daemon.log)
 // ---------------------------------------------------------------------------
-function log(...a) { process.stderr.write(`[${new Date().toISOString()}] ${a.join(' ')}\n`); }
-function errlog(...a) { process.stderr.write(`[ERR ${new Date().toISOString()}] ${a.join(' ')}\n`); }
+const DAEMON_LOG = path.join(TOKEN_DIR, 'daemon.log');
+const DAEMON_LOG_MAX_BYTES = 1024 * 1024; // keep the last ~1MB of history
+
+// If daemon.log has grown past DAEMON_LOG_MAX_BYTES, truncate it down to the
+// trailing ~1MB (dropping the partial first line) before appending.
+function truncateDaemonLogIfNeeded() {
+  try {
+    const st = fs.statSync(DAEMON_LOG);
+    if (st.size <= DAEMON_LOG_MAX_BYTES) return;
+    const fd = fs.openSync(DAEMON_LOG, 'r');
+    const buf = Buffer.alloc(DAEMON_LOG_MAX_BYTES);
+    const { bytesRead } = fs.readSync(fd, buf, 0, DAEMON_LOG_MAX_BYTES, Math.max(0, st.size - DAEMON_LOG_MAX_BYTES));
+    fs.closeSync(fd);
+    let tail = buf.slice(0, bytesRead).toString('utf8');
+    const nl = tail.indexOf('\n');
+    if (nl >= 0) tail = tail.slice(nl + 1);
+    fs.writeFileSync(DAEMON_LOG, tail);
+  } catch (e) { /* ignore */ }
+}
+
+function daemonLog(line) {
+  try {
+    fs.mkdirSync(TOKEN_DIR, { recursive: true });
+    truncateDaemonLogIfNeeded();
+    fs.appendFileSync(DAEMON_LOG, line + '\n');
+  } catch (e) { /* never let logging crash the daemon */ }
+}
+
+// Return the last n non-empty lines of daemon.log (or null if unavailable) —
+// used by gpt_status to surface why the daemon is unhealthy.
+function tailDaemonLog(n) {
+  try {
+    const raw = fs.readFileSync(DAEMON_LOG, 'utf8');
+    const lines = raw.split('\n').filter((l) => l.trim().length > 0);
+    return lines.length ? lines.slice(-n).join('\n') : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function log(...a) {
+  const line = `[${new Date().toISOString()}] ${a.join(' ')}`;
+  if (DAEMON) daemonLog(line); else process.stderr.write(line + '\n');
+}
+function errlog(...a) {
+  const line = `[ERR ${new Date().toISOString()}] ${a.join(' ')}`;
+  if (DAEMON) daemonLog(line); else process.stderr.write(line + '\n');
+}
 
 // ---------------------------------------------------------------------------
 // Token store
@@ -229,7 +287,13 @@ function postForm(url, form) {
       res.on('error', reject);
     });
     req.on('error', reject);
-    req.on('timeout', () => { req.destroy(new Error('upstream timeout')); });
+    req.on('timeout', () => {
+      // Upstream (e.g. the auth token endpoint during a chat-triggered refresh)
+      // did not respond in time -> surface as 504.
+      const e = new Error('upstream headers timeout');
+      e.upstreamStatus = 504;
+      req.destroy(e);
+    });
     req.write(body);
     req.end();
   });
@@ -241,6 +305,86 @@ function base64url(buf) {
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+// ---------------------------------------------------------------------------
+// Detached proxy daemon (v0.1.9)
+//
+// Port 8787 lives in a DETACHED daemon process, not inside the per-session MCP
+// stdio process. When ZCode reaps an idle session it kills the MCP process; the
+// daemon (new process group, reparented to PID 1 / launchd) survives, so the
+// next session finds the proxy already up — no slow "reconnect after idle".
+// ---------------------------------------------------------------------------
+const HEALTHZ_URL = `http://${PROXY_HOST}:${PROXY_PORT}/healthz`;
+const SHUTDOWN_URL = `http://${PROXY_HOST}:${PROXY_PORT}/shutdown`;
+
+// GET /healthz; resolves to the running server's version string, or null if the
+// daemon is unreachable (connection refused) or not reporting a version.
+async function daemonHealth(timeoutMs = 2000) {
+  try {
+    const h = await getJSON(HEALTHZ_URL, {}, timeoutMs);
+    if (h.status !== 200) return null;
+    try { return JSON.parse(h.body).version || null; } catch (e) { return null; }
+  } catch (e) {
+    return null;
+  }
+}
+
+// POST /shutdown with the CSRF-safe custom header, then wait for the port to
+// free (the daemon exits itself ~300ms after acknowledging).
+async function daemonShutdown() {
+  try {
+    const s = await requestJSON(SHUTDOWN_URL, 'POST', { 'x-gpt-oauth-shutdown': '1' }, 3000);
+    log('Daemon /shutdown request returned status ' + s.status);
+  } catch (e) {
+    log('Daemon /shutdown request failed: ' + (e.message || e));
+  }
+  const deadline = Date.now() + 10000;
+  while (Date.now() < deadline) {
+    if (!(await daemonHealth(500))) break; // port no longer serving
+    await sleep(300);
+  }
+}
+
+// Spawn the detached daemon (uses process.execPath so relative-executable PATH
+// issues from GUI launches don't apply, and __filename is an absolute path).
+function spawnDaemon() {
+  const child = spawn(process.execPath, [__filename, '--daemon'], {
+    detached: true,   // new process group / session: survives parent death
+    stdio: 'ignore',  // daemon logs go to ~/.zcode/gpt-oauth/daemon.log
+  });
+  child.unref();
+  return child;
+}
+
+// Ensure a healthy, at-least-this-version daemon owns port 8787.
+//  - healthy (version >= VERSION): reuse it, return immediately.
+//  - older version: /shutdown it (daemon-vs-daemon takeover), then spawn ours.
+//  - unreachable: spawn a fresh daemon.
+//  - poll /healthz every 400ms up to 20s for it to come up.
+async function ensureDaemon() {
+  const existing = await daemonHealth(2000);
+  if (existing) {
+    if (compareVersions(existing, VERSION) >= 0) {
+      log('Daemon healthy (v' + existing + '); reusing it');
+      return true;
+    }
+    log('Daemon version ' + existing + ' is older than v' + VERSION + '; takeover via /shutdown handshake');
+    await daemonShutdown();
+  }
+  const child = spawnDaemon();
+  log('Spawned detached daemon (pid ' + child.pid + ') using ' + process.execPath);
+  const deadline = Date.now() + 20000;
+  while (Date.now() < deadline) {
+    await sleep(400);
+    const v = await daemonHealth(1000);
+    if (v) {
+      log('Daemon healthy after spawn (v' + v + '); proxy ready');
+      return true;
+    }
+  }
+  errlog('Daemon did not become healthy within 20s; proxy may be unavailable');
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -573,12 +717,25 @@ async function handleTool(name, params) {
     case 'gpt_status': {
       const store = loadStore();
       const updateStatus = await getUpdateStatus();
+      // proxyRunning == daemon healthy. If the daemon is missing we try to
+      // (re)spawn it, then report the last lines of daemon.log if it still
+      // won't come up. --mcp-only sessions do NOT spawn the daemon (tests).
       let proxyRunning = false;
       try {
-        const h = await getJSON(`http://${PROXY_HOST}:${PROXY_PORT}/healthz`, {}, 2000);
+        const h = await getJSON(HEALTHZ_URL, {}, 2000);
         proxyRunning = h.status === 200;
       } catch (e) { proxyRunning = false; }
-      const lastError = global.lastError || null;
+      if (!proxyRunning && !MCP_ONLY) {
+        try {
+          await ensureDaemon();
+          proxyRunning = !!(await daemonHealth(2000));
+        } catch (e) { /* swallowed; report below */ }
+      }
+      let lastError = global.lastError || null;
+      if (!proxyRunning) {
+        const daemonTail = tailDaemonLog(5);
+        if (daemonTail) lastError = daemonTail;
+      }
       if (!store) {
         return mcpResult({
           loggedIn: false, email: null, accountId: null, expires: null,
@@ -810,10 +967,12 @@ function postBackend(store, body, retry = true) {
     };
     if (store.accountId) headers['chatgpt-account-id'] = store.accountId;
     const mod = driverFor(u);
+    let gotHeaders = false;
     const req = mod.request({
       hostname: u.hostname, port: u.port || (u.protocol === 'https:' ? 443 : 80), path: u.pathname + u.search, method: 'POST', headers,
-      timeout: 120000,
+      timeout: 120000, // total idle timeout once headers have arrived
     }, (res) => {
+      gotHeaders = true;
       let buf = '';
       res.on('data', (c) => { buf += c; });
       res.on('end', () => {
@@ -828,10 +987,28 @@ function postBackend(store, body, retry = true) {
       });
       res.on('error', reject);
     });
-    req.on('error', reject);
-    req.on('timeout', () => { req.destroy(new Error('upstream timeout')); });
+    // TTFB guard: if the upstream has not sent response HEADERS within 45s,
+    // fail fast with a 504 instead of letting the full 120s socket timeout eat
+    // the request (a silently-hanging upstream must not stall the proxy).
+    const headersTimer = setTimeout(() => {
+      const e = new Error('upstream headers timeout (no response after 45s)');
+      e.upstreamStatus = 504;
+      req.destroy(e);
+    }, 45000);
+    req.on('error', (e) => {
+      clearTimeout(headersTimer);
+      reject(e);
+    });
+    req.on('timeout', () => {
+      const e = new Error(gotHeaders ? 'upstream timeout' : 'upstream headers timeout (no response after 45s)');
+      if (!gotHeaders) e.upstreamStatus = 504;
+      req.destroy(e);
+    });
     req.write(json);
     req.end();
+    // Clear the TTFB timer once headers arrived; the socket timeout (120s)
+    // remains in force for the response body after that.
+    req.on('response', () => clearTimeout(headersTimer));
   });
 }
 
@@ -1170,12 +1347,37 @@ function startProxy(onStart, onPortLock) {
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
-function main() {
-  log('gpt-oauth server v' + VERSION + ' http=' + RUN_HTTP + ' mcp=' + RUN_MCP);
-  if (RUN_MCP) startMCP();
+async function main() {
+  log('gpt-oauth server v' + VERSION + ' mode=' + (DAEMON ? 'daemon' : (HTTP_ONLY ? 'http-only' : 'mcp')) + ' http=' + RUN_HTTP + ' mcp=' + RUN_MCP);
+  if (DAEMON) {
+    // Detached daemon: sole owner of port 8787, logs to daemon.log.
+    startProxy((port) => { log('Proxy daemon ready on port ' + port); }, () => {
+      // An equal-or-newer daemon already owns the port; this process is
+      // redundant (e.g. a version race), so exit quietly.
+      log('Another daemon owns port ' + PROXY_PORT + '; this daemon exits');
+      process.exit(0);
+    });
+    return;
+  }
+  if (RUN_MCP) {
+    // Ensure the detached daemon is up BEFORE MCP stdio begins, so the proxy
+    // is available immediately for this (and every future) session. MCP-only
+    // sessions deliberately skip this to keep tests side-effect free.
+    if (!MCP_ONLY) {
+      try {
+        await ensureDaemon();
+      } catch (e) {
+        errlog('ensureDaemon failed: ' + (e && e.stack ? e.stack : String(e)));
+      }
+    }
+    startMCP();
+    return;
+  }
   if (RUN_HTTP) {
     startProxy((port) => { log('Proxy ready on port ' + port); }, () => { log('No proxy owned (another instance has it).'); });
   }
 }
 
-main();
+main().catch((e) => {
+  errlog('startup failure: ' + (e && e.stack ? e.stack : String(e)));
+});

@@ -2,10 +2,10 @@
 
 A ZCode plugin that provides ChatGPT (GPT Plus) OAuth login and a local OpenAI-compatible proxy so you can use GPT models in subagents **without an API key** (using your ChatGPT Plus subscription).
 
-The plugin contains a single Node process (zero dependencies, Node >= 18) that runs both:
+The plugin is a single Node codebase (zero dependencies, Node >= 18) running as two cooperating processes:
 
-- an **MCP stdio server** (`gpt_login`, `gpt_logout`, `gpt_status` tools), and
-- an **OpenAI-compatible HTTP proxy** on `http://127.0.0.1:8787/v1` that translates Chat Completions into the OpenAI Codex backend.
+- an **MCP stdio server** per session (`gpt_login`, `gpt_logout`, `gpt_status` tools), and
+- a **detached HTTP proxy daemon** on `http://127.0.0.1:8787/v1` that translates Chat Completions into the OpenAI Codex backend and survives MCP-session reaping (see [Architecture & update](#architecture--update)).
 
 ## Install
 
@@ -33,16 +33,16 @@ The plugin contains a single Node process (zero dependencies, Node >= 18) that r
 | `8787` | HTTP proxy (OpenAI-compatible Chat Completions). Binds loopback only. |
 | `1455` | OAuth callback loopback server during login (falls back to a random port if busy). |
 
-If port `8787` is already owned by another instance, the newer instance attempts a **version-aware takeover** (loopback handshake described below). If the existing instance is the same or newer, the second instance serves MCP only.
+## Architecture & update
 
-## Update mechanism
+Since v0.1.9 the HTTP proxy on port `8787` runs inside a **detached daemon process** (`server.js --daemon`), *not* inside the per-session MCP stdio process:
 
-Updating the plugin (via **Settings → Plugin Management → update**, then restart ZCode) requires **no manual process killing**. When the updated server starts and finds an older instance already bound to port `8787`, it performs a safe handshake instead of erroring out:
+1. **The daemon owns the port independently of MCP sessions.** When ZCode reaps an idle session it kills the MCP stdio process, but the daemon is in its own process group (a new session), so port `8787` stays up. The next session finds the proxy already running — no slow "reconnect after idle".
+2. **Any MCP-mode process auto-(re)spawns the daemon if it is missing.** On startup each MCP process calls `GET /healthz`; if the daemon is unreachable it spawns `node server.js --daemon` (detached, `stdio: ignore`, logs to `~/.zcode/gpt-oauth/daemon.log`, kept to the last ~1&nbsp;MB), then polls `/healthz` every 400&nbsp;ms for up to 20&nbsp;s before starting MCP stdio.
+3. **Version takeover happens daemon-vs-daemon.** If the running daemon's `version` is **older** than the code, the new process calls `POST /shutdown` with the `x-gpt-oauth-shutdown: 1` header (a CSRF-safe custom header that ordinary web forms cannot send — without it the endpoint returns `403`), waits for the port to free, spawns its own daemon and takes over. Equal or newer → reuse.
+4. `gpt_status` reports `proxyRunning` (daemon health) and, if the daemon cannot be brought up, `lastError` containing the last 5 lines of `daemon.log`.
 
-1. The new process calls `GET /healthz` on the existing instance and reads its `version`.
-2. If the existing version is **older**, it calls `POST /shutdown` with the `x-gpt-oauth-shutdown: 1` header (a CSRF-safe custom header that ordinary web forms cannot send — without it the endpoint returns `403`).
-3. The old instance responds `{ok:true}` and exits itself (~300 ms).
-4. The new process polls `/healthz` until the port frees, then binds `8787`. If the existing instance is the same/newer version (or unreachable), the new process serves MCP only.
+Updating the plugin (via **Settings → Plugin Management → update**, then restart ZCode) requires **no manual process killing** — the recommended flow is unchanged: start the updated version, let it take over from any older instance via the handshake above, and let the daemon re-spawn from the current code.
 
 `/gpt-oauth:status` (`gpt_status`) also reports `latestVersion` and `updateAvailable` (checked against the marketplace, cached for an hour), so you can see when a new release is available.
 
@@ -82,7 +82,7 @@ Streaming responses (`stream: true`) are emitted after the upstream model comple
 
 - **Model 404 ("model not found on backend")**: the backend may not serve the advertised model. Edit the model list in **Settings → Model settings** for the `gpt-oauth` provider (add one of the working ids from below, or the ones the backend reports).
 - **401 "re-login required"**: run `/gpt-oauth:login` again to re-authenticate.
-- **Proxy not reachable**: ensure the plugin's MCP server is enabled and restart ZCode.
+- **Proxy not reachable**: any MCP-mode process auto-spawns the daemon on startup, so usually just using the plugin restores it. If it is still down, check the last lines of `~/.zcode/gpt-oauth/daemon.log` and ensure the plugin's MCP server is enabled, then restart ZCode.
 - **MCP "Reconnecting forever"**: the process now survives unexpected errors (logs to stderr, never exits). If you still see it, restart ZCode once so the new process starts.
 
 ## Verified working model ids
