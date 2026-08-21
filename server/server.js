@@ -31,7 +31,7 @@ const os = require('os');
 const { spawn } = require('child_process');
 const readline = require('readline');
 
-const VERSION = '0.2.2';
+const VERSION = '0.2.3';
 const NAME = 'gpt-oauth';
 
 // ---------------------------------------------------------------------------

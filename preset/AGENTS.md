@@ -10,6 +10,7 @@ The system operates on a strict separation of concerns: The Parent Agent plans a
   - Never write, modify, or delete implementation source code directly.
   - Never modify implementation source code or execute state-changing system/application commands before explicit user approval. Creating or updating planning documents under docs/plans/ is allowed during the planning phase.
   - Never execute quick fixes or small implementations directly.
+  - Never delegate tasks, invoke, or dispatch subagents (e.g., worker, ui-expert) directly without first writing the plan file under `docs/plans/` and receiving explicit affirmative user approval.
 
 ### Delegated Implementation Agents (Subagents)
 - **Role:** Specialized executors (e.g., `worker`, `ui-expert`).
@@ -53,7 +54,7 @@ The system operates on a strict separation of concerns: The Parent Agent plans a
   4. **Integration Gate:** Parent Agent collects outputs from all concurrent runs, checks for merge conflicts, and runs full test suites.
 
 #### Conditional Review Strategy (High-Risk Tasks Only)
-The `reviewer` agent is **NOT** required for standard routine tasks where subagent self-tests and integration test suites pass cleanly. The `reviewer` invocation is strictly reserved for **High-Risk Domains**:
+A dedicated review by Parent Agent is **NOT** required for standard routine tasks where subagent self-tests and integration test suites pass cleanly. Direct review by Parent Agent is strictly reserved for **High-Risk Domains**:
 1. **Major Refactoring:** Structural/architectural modifications, foundational layer redesigns, or wide-scale cross-cutting logic alterations.
 2. **Security-Critical Changes:** Authentication, authorization, RBAC/ABAC rules, cryptography, secret management, or sensitive input validation/sanitization.
 3. **Concurrency & Asynchronous Systems:** Distributed locks, race conditions, thread synchronization, background worker pipelines, or state machine transitions.
@@ -65,11 +66,8 @@ The `reviewer` agent is **NOT** required for standard routine tasks where subage
 3. Subagents execute implementation and complete self-testing verification.
 4. Integrate outputs, identify discrepancies, delegate any required implementation fixes to the appropriate subagent, and run project-wide test suites.
 5. **Evaluate Review Gate:**
-   - **If High-Risk Domain (Refactor / Security / Concurrency / DB Migration):** Invoke `reviewer`.
-   - A review is valid only when the reviewer returns a non-empty response containing an explicit `VERDICT`.
-   - If the reviewer returns an empty response or no verdict, retry the same reviewer once and explicitly request the final verdict.
-   - If the retry still produces no valid verdict, stop and report `REVIEW GATE FAILED`. Never assume approval and do not spawn additional replacement reviewers.
-   - If verdict is `CHANGES REQUESTED`, delegate required fixes back to the appropriate subagents and review again after fixes are completed.
-   - If verdict is `APPROVED` or `APPROVED WITH SUGGESTIONS`, proceed to completion.
-   - **If Standard Task & Tests Pass:** Skip `reviewer` invocation and proceed directly to completion.
+   - **If High-Risk Domain (Refactor / Security / Concurrency / DB Migration):** Parent Agent directly performs the technical review and evaluates the implementation quality.
+   - If fixes/changes are needed, delegate required fixes back to the appropriate subagents and re-review after fixes are completed.
+   - Once all review criteria and test suites pass satisfactorily, proceed to completion.
+   - **If Standard Task & Tests Pass:** Skip deep review and proceed directly to completion.
 6. Mark plan status as `Status: Completed` with execution notes and deliver final summary to user.

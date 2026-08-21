@@ -5,7 +5,7 @@
       "name": "gpt-oauth",
       "source": "./",
       "description": "ChatGPT (GPT Plus) OAuth login and OpenAI-compatible local proxy for ZCode — use GPT models in subagents without an API key",
-      "version": "0.2.2",
+      "version": "0.2.3",
       "author": { "name": "KhanhVu" }
     }
   ]
