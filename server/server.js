@@ -25,7 +25,7 @@ const os = require('os');
 const { spawn } = require('child_process');
 const readline = require('readline');
 
-const VERSION = '0.1.6';
+const VERSION = '0.1.7';
 const NAME = 'gpt-oauth';
 
 // ---------------------------------------------------------------------------
@@ -330,7 +330,13 @@ async function resolveAccount(store) {
 function openBrowser(url) {
   try {
     if (process.platform === 'win32') {
-      spawn('cmd', ['/c', 'start', '', url], { stdio: 'ignore', detached: true }).on('error', () => {});
+      // Pass the URL directly to Windows handlers; cmd.exe would re-parse '&'
+      // query separators as command delimiters and truncate the authorize URL.
+      spawn('rundll32', ['url.dll,FileProtocolHandler', url], { stdio: 'ignore' }).on('error', () => {
+        spawn('explorer', [url], { stdio: 'ignore' }).on('error', () => {
+          errlog('Could not open browser. Open this URL manually: ' + url);
+        });
+      });
     } else if (process.platform === 'darwin') {
       spawn('open', [url], { stdio: 'ignore' }).on('error', () => {});
     } else {

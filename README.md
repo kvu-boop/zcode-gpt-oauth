@@ -49,7 +49,7 @@ Tokens are stored at `~/.zcode/gpt-oauth/auth.json`:
 
 ### Windows
 
-Windows requires Node.js to be available in `PATH`. The plugin opens the default browser via `cmd /c start`; tokens are stored at `%USERPROFILE%\.zcode\gpt-oauth\auth.json`.
+Windows requires Node.js to be available in `PATH`. The plugin opens the default browser via `rundll32 url.dll,FileProtocolHandler` (avoiding `cmd.exe` ampersand query parsing), with `explorer` as a fallback. If the browser does not open, the login result includes the authorize URL so you can open it manually. Tokens are stored at `%USERPROFILE%\.zcode\gpt-oauth\auth.json`.
 
 ## Security notes
 
