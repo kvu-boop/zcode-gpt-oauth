@@ -32,6 +32,8 @@ Since v0.2.0 the plugin bundles the author's personal ZCode config under `preset
 
 - `/gpt-oauth:setup-agents` — copies `preset/AGENTS.md` → `~/.zcode/AGENTS.md` and every `preset/agents/*.md` → `~/.zcode/agents/` (**worker**, **ui-expert**, **reviewer**, plus the plan **template**).
 
+The command works on **macOS and Windows**: it detects the platform first and gives both bash (macOS/Linux) and PowerShell (Windows) forms for every shell step, including a pure-python neutralization script (run with `python3`, or `python`/`py -3` on Windows).
+
 What it does:
 
 1. Locates the `preset/` folder inside the installed plugin; if it is missing the plugin is outdated — update it first.
