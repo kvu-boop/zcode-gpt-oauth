@@ -33,7 +33,22 @@ The plugin contains a single Node process (zero dependencies, Node >= 18) that r
 | `8787` | HTTP proxy (OpenAI-compatible Chat Completions). Binds loopback only. |
 | `1455` | OAuth callback loopback server during login (falls back to a random port if busy). |
 
-If port `8787` is already owned by a healthy instance (healthz OK), a second instance serves MCP only. If present but unhealthy, it retries for ~30s then falls back to `8788`.
+If port `8787` is already owned by another instance, the newer instance attempts a **version-aware takeover** (loopback handshake described below). If the existing instance is the same or newer, the second instance serves MCP only.
+
+## Update mechanism
+
+Updating the plugin (via **Settings → Plugin Management → update**, then restart ZCode) requires **no manual process killing**. When the updated server starts and finds an older instance already bound to port `8787`, it performs a safe handshake instead of erroring out:
+
+1. The new process calls `GET /healthz` on the existing instance and reads its `version`.
+2. If the existing version is **older**, it calls `POST /shutdown` with the `x-gpt-oauth-shutdown: 1` header (a CSRF-safe custom header that ordinary web forms cannot send — without it the endpoint returns `403`).
+3. The old instance responds `{ok:true}` and exits itself (~300 ms).
+4. The new process polls `/healthz` until the port frees, then binds `8787`. If the existing instance is the same/newer version (or unreachable), the new process serves MCP only.
+
+`/gpt-oauth:status` (`gpt_status`) also reports `latestVersion` and `updateAvailable` (checked against the marketplace, cached for an hour), so you can see when a new release is available.
+
+## Image input
+
+The proxy accepts **both text and image input**. In Chat Completions, `user` message parts with `{"type":"image_url","image_url":{"url": ...}}` are forwarded as `input_image`. `data:image/...;base64,...` URLs pass through unchanged and `http(s)` URLs are passed through for the backend to validate. The model entries this plugin registers advertise `modalities.input: ["text", "image"]`.
 
 ## Token storage
 
@@ -68,7 +83,7 @@ Streaming responses (`stream: true`) are emitted after the upstream model comple
 - **Model 404 ("model not found on backend")**: the backend may not serve the advertised model. Edit the model list in **Settings → Model settings** for the `gpt-oauth` provider (add one of the working ids from below, or the ones the backend reports).
 - **401 "re-login required"**: run `/gpt-oauth:login` again to re-authenticate.
 - **Proxy not reachable**: ensure the plugin's MCP server is enabled and restart ZCode.
-- **Image input not supported**: the proxy only forwards text input (image-parts return HTTP 400).
+- **MCP "Reconnecting forever"**: the process now survives unexpected errors (logs to stderr, never exits). If you still see it, restart ZCode once so the new process starts.
 
 ## Verified working model ids
 

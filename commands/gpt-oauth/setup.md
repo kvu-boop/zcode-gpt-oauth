@@ -33,9 +33,9 @@ Register the gpt-oauth local proxy as an OpenAI-compatible provider in ZCode's m
   },
   "source": "custom",
   "models": {
-    "gpt-5.6-sol":  { "limit": { "context": 256000, "output": 128000 }, "modalities": { "input": ["text"], "output": ["text"] } },
-    "gpt-5.6-terra":{ "limit": { "context": 256000, "output": 128000 }, "modalities": { "input": ["text"], "output": ["text"] } },
-    "gpt-5.6-luna": { "limit": { "context": 256000, "output": 128000 }, "modalities": { "input": ["text"], "output": ["text"] } }
+    "gpt-5.6-sol":  { "limit": { "context": 256000, "output": 128000 }, "modalities": { "input": ["text", "image"], "output": ["text"] } },
+    "gpt-5.6-terra":{ "limit": { "context": 256000, "output": 128000 }, "modalities": { "input": ["text", "image"], "output": ["text"] } },
+    "gpt-5.6-luna": { "limit": { "context": 256000, "output": 128000 }, "modalities": { "input": ["text", "image"], "output": ["text"] } }
   }
 }
 ```

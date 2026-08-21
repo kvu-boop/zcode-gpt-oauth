@@ -25,8 +25,20 @@ const os = require('os');
 const { spawn } = require('child_process');
 const readline = require('readline');
 
-const VERSION = '0.1.7';
+const VERSION = '0.1.8';
 const NAME = 'gpt-oauth';
+
+// ---------------------------------------------------------------------------
+// Process resilience: never exit on an unexpected error/rejection. Log the
+// full error to stderr and keep serving (avoids "@@ -MCP Reconnecting forever"
+// loops caused by a crash elsewhere in the process).
+// ---------------------------------------------------------------------------
+process.on('uncaughtException', (err) => {
+  errlog('uncaughtException: ' + (err && err.stack ? err.stack : String(err)));
+});
+process.on('unhandledRejection', (reason) => {
+  errlog('unhandledRejection: ' + (reason && reason.stack ? reason.stack : String(reason)));
+});
 
 // ---------------------------------------------------------------------------
 // Config / paths
@@ -47,7 +59,6 @@ const OPENCODE_AUTH = path.join(os.homedir(), '.local', 'share', 'opencode', 'au
 
 const PROXY_HOST = '127.0.0.1';
 const PROXY_PORT = 8787;
-const FALLBACK_PORT = 8788;
 const OAUTH_PORT = 1455;
 const OAUTH_MAX_WAIT_MS = 5 * 60 * 1000;
 
@@ -167,6 +178,37 @@ function getJSON(url, headers, timeoutMs = 20000) {
   });
 }
 
+function requestJSON(url, method, headers, timeoutMs = 3000) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const mod = driverFor(u);
+    const req = mod.request({
+      hostname: u.hostname,
+      port: u.port || (u.protocol === 'https:' ? 443 : 80),
+      path: u.pathname + u.search,
+      method,
+      headers: headers || {},
+      timeout: timeoutMs,
+    }, (res) => {
+      let body = '';
+      res.on('data', (c) => { body += c; });
+      res.on('end', () => resolve({ status: res.statusCode, body }));
+    });
+    req.on('error', reject);
+    req.on('timeout', () => req.destroy(new Error('timeout')));
+    req.end();
+  });
+}
+
+function compareVersions(a, b) {
+  const left = String(a || '').split('.').map((v) => Number.parseInt(v, 10) || 0);
+  const right = String(b || '').split('.').map((v) => Number.parseInt(v, 10) || 0);
+  for (let i = 0; i < Math.max(left.length, right.length); i++) {
+    if ((left[i] || 0) !== (right[i] || 0)) return (left[i] || 0) < (right[i] || 0) ? -1 : 1;
+  }
+  return 0;
+}
+
 function postForm(url, form) {
   return new Promise((resolve, reject) => {
     const u = new URL(url);
@@ -197,9 +239,35 @@ function base64url(buf) {
   return Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 // ---------------------------------------------------------------------------
 // Refresh token
 // ---------------------------------------------------------------------------
+let lastUpdateCheck = { at: 0, latest: null };
+const UPDATE_URL = 'https://raw.githubusercontent.com/kvu-boop/zcode-gpt-oauth/main/marketplace.json';
+
+async function getUpdateStatus() {
+  const now = Date.now();
+  if (now - lastUpdateCheck.at < 60 * 60 * 1000) {
+    return lastUpdateCheck.latest;
+  }
+  try {
+    const res = await getJSON(UPDATE_URL, {}, 5000);
+    if (res.status < 200 || res.status >= 300) throw new Error('update check HTTP ' + res.status);
+    const data = JSON.parse(res.body);
+    const latest = data && data.plugins && data.plugins[0] && data.plugins[0].version;
+    if (!latest) throw new Error('update response missing version');
+    lastUpdateCheck = { at: now, latest: { latestVersion: String(latest), updateAvailable: compareVersions(VERSION, latest) < 0 } };
+    return lastUpdateCheck.latest;
+  } catch (e) {
+    lastUpdateCheck = { at: now, latest: { latestVersion: null, updateError: String(e.message || e) } };
+    return lastUpdateCheck.latest;
+  }
+}
+
 let refreshPromise = null;   // in-flight refresh, for dedupe across concurrent requests
 let refreshFailedCount = 0;  // consecutive refresh failures; store cleared only after threshold
 const REFRESH_FAIL_THRESHOLD = 3;
@@ -504,6 +572,7 @@ async function handleTool(name, params) {
     }
     case 'gpt_status': {
       const store = loadStore();
+      const updateStatus = await getUpdateStatus();
       let proxyRunning = false;
       try {
         const h = await getJSON(`http://${PROXY_HOST}:${PROXY_PORT}/healthz`, {}, 2000);
@@ -514,6 +583,7 @@ async function handleTool(name, params) {
         return mcpResult({
           loggedIn: false, email: null, accountId: null, expires: null,
           accessValid: false, proxyRunning, lastError,
+          ...updateStatus,
         });
       }
       return mcpResult({
@@ -524,6 +594,7 @@ async function handleTool(name, params) {
         accessValid: store.expires > Date.now(),
         proxyRunning,
         lastError,
+        ...updateStatus,
       });
     }
     default:
@@ -621,14 +692,27 @@ function buildBackendBody(body) {
     }
     if (role === 'user') {
       if (Array.isArray(content)) {
-        const hasImage = content.some((c) => c && (c.type === 'image_url' || c.type === 'image'));
-        if (hasImage) {
-          const e = new Error('image input not supported');
-          e.code = 400;
-          throw e;
+        const parts = [];
+        for (const c of content) {
+          if (!c) continue;
+          if (c.type === 'text') {
+            parts.push({ type: 'input_text', text: String(c.text || '') });
+          } else if (c.type === 'image_url' || c.type === 'image') {
+            // data:image/...;base64,... and http(s) URLs pass through unchanged.
+            const imgUrl = c.type === 'image_url' ? (c.image_url && c.image_url.url) : c.image_url;
+            if (typeof imgUrl !== 'string' || !imgUrl) {
+              const e = new Error('content part "' + c.type + '" missing url');
+              e.code = 400;
+              throw e;
+            }
+            parts.push({ type: 'input_image', image_url: imgUrl });
+          } else {
+            const e = new Error('unsupported content part type: ' + c.type);
+            e.code = 400;
+            throw e;
+          }
         }
-        const txt = content.map((c) => (c && c.type === 'text' ? c.text : '')).join('\n');
-        input.push({ type: 'message', role: 'user', content: [{ type: 'input_text', text: txt }] });
+        input.push({ type: 'message', role: 'user', content: parts });
       } else {
         input.push({ type: 'message', role: 'user', content: [{ type: 'input_text', text: String(content || '') }] });
       }
@@ -909,18 +993,42 @@ async function handleStream(clientRes, clientBody) {
 // HTTP proxy listener
 // ---------------------------------------------------------------------------
 function startProxy(onStart, onPortLock) {
-  const server = http.createServer(async (req, res) => {
+  const server = http.createServer((req, res) => {
     const start = process.hrtime.bigint();
-    const url = new URL(req.url, `http://${PROXY_HOST}`);
+    // Wrap the whole handler so a malformed request can never throw and crash
+    // the process synchronously.
+    let url;
+    try {
+      url = new URL(req.url, `http://${PROXY_HOST}`);
+    } catch (e) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'bad request path' } }));
+      return;
+    }
     const method = req.method;
     let body = '';
     req.on('data', (c) => { body += c; });
+    req.on('error', () => { /* ignore client abort mid-body */ });
     req.on('end', async () => {
       try {
         if (method === 'GET' && url.pathname === '/healthz') {
           const store = loadStore();
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: true, loggedIn: !!(store && store.refresh), modelCount: MODEL_IDS.length }));
+          res.end(JSON.stringify({ ok: true, version: VERSION, loggedIn: !!(store && store.refresh), modelCount: MODEL_IDS.length }));
+          return;
+        }
+        if (method === 'POST' && url.pathname === '/shutdown') {
+          // CSRF-safe: only an explicit custom header (which forms can't send)
+          // authorizes a shutdown. Without it -> 403.
+          if (String(req.headers['x-gpt-oauth-shutdown']) !== '1') {
+            res.writeHead(403, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: { message: 'forbidden' } }));
+            return;
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+          log('Received authorized /shutdown; exiting in 300ms');
+          setTimeout(() => process.exit(0), 300);
           return;
         }
         if (method === 'GET' && url.pathname === '/v1/models') {
@@ -977,36 +1085,78 @@ function startProxy(onStart, onPortLock) {
   });
 
   function handlePortLock() {
-    // check healthz on the locked port
-    getJSON(`http://${PROXY_HOST}:${PROXY_PORT}/healthz`, {}, 2000).then((h) => {
+    // Version-aware takeover: if the existing instance is OLDER than us, shut
+    // it down via the loopback handshake and take the port. Otherwise (same or
+    // newer, or unreachable) fall back to MCP-only.
+    getJSON(`http://${PROXY_HOST}:${PROXY_PORT}/healthz`, {}, 3000).then(async (h) => {
+      let existingVersion = null;
+      try { existingVersion = JSON.parse(h.body).version; } catch (e) { /* non-JSON */ }
+      if (h.status === 200 && existingVersion && compareVersions(existingVersion, VERSION) < 0) {
+        log(`Existing proxy on :${PROXY_PORT} is older (v${existingVersion} < v${VERSION}); taking over via /shutdown handshake`);
+        await shutdownAndTakeover();
+        return;
+      }
       if (h.status === 200) {
-        log('Proxy already owned by another instance (healthz OK). MCP-only for this process.');
+        log('Proxy already owned by this/same-or-newer version (healthz OK). MCP-only for this process.');
         onPortLock(false);
       } else {
-        // not healthy -> retry
-        log('Port ' + PROXY_PORT + ' busy and not healthy; will retry');
-        retryLock();
+        log('Port ' + PROXY_PORT + ' busy but healthz not OK; MCP-only fallback for this process.');
+        onPortLock(false);
       }
-    }).catch(() => retryLock());
+    }).catch(() => {
+      log('Port ' + PROXY_PORT + ' busy and healthz unreachable; MCP-only fallback for this process.');
+      onPortLock(false);
+    });
   }
 
-  let tries = 0;
-  function retryLock() {
-    tries++;
-    if (tries > 60) { // 30s / 500ms
-      log('Port ' + PROXY_PORT + ' still locked; falling back to ' + FALLBACK_PORT);
-      server.listen(FALLBACK_PORT, PROXY_HOST, () => {
-        log('Proxy listening on http://' + PROXY_HOST + ':' + FALLBACK_PORT);
-        onStart(FALLBACK_PORT);
-      });
+  async function shutdownAndTakeover() {
+    try {
+      const s = await requestJSON(`http://${PROXY_HOST}:${PROXY_PORT}/shutdown`, 'POST', { 'x-gpt-oauth-shutdown': '1' }, 3000);
+      if (s.status !== 200) {
+        log('Takeover: shutdown rejected (status ' + s.status + '); MCP-only fallback.');
+        onPortLock(false);
+        return;
+      }
+      log('Takeover: shutdown accepted; waiting for port to free');
+    } catch (e) {
+      log('Takeover: shutdown request failed: ' + (e.message || e) + '; MCP-only fallback.');
+      onPortLock(false);
       return;
     }
-    setTimeout(() => {
-      server.listen(PROXY_PORT, PROXY_HOST, () => {
-        log('Proxy listening on http://' + PROXY_HOST + ':' + PROXY_PORT);
-        onStart(PROXY_PORT);
+    // Poll healthz until the old process is gone (its socket closed), up to 10s.
+    const deadline = Date.now() + 10000;
+    while (Date.now() < deadline) {
+      let available = false;
+      try {
+        await getJSON(`http://${PROXY_HOST}:${PROXY_PORT}/healthz`, {}, 1000);
+      } catch (e) {
+        available = true; // connection refused -> port no longer serving
+      }
+      if (available) break;
+      await sleep(300);
+    }
+    // Retry listening on 8787 (10 attempts, 500ms apart).
+    for (let i = 0; i < 10; i++) {
+      const ok = await new Promise((resolve) => {
+        server.removeAllListeners('error');
+        server.once('error', (e) => resolve(e.code === 'EADDRINUSE' ? 'busy' : e));
+        server.listen(PROXY_PORT, PROXY_HOST, () => resolve('ok'));
       });
-    }, 500);
+      if (ok === 'ok') {
+        log('Takeover successful: proxy listening on http://' + PROXY_HOST + ':' + PROXY_PORT);
+        onStart(PROXY_PORT);
+        return;
+      }
+      if (ok !== 'busy') {
+        errlog('Takeover: listen error: ' + (ok.message || ok));
+        onPortLock(false);
+        return;
+      }
+      log('Takeover retry ' + (i + 1) + ': port still busy; retrying in 500ms');
+      await sleep(500);
+    }
+    log('Takeover failed after 10 attempts; MCP-only fallback.');
+    onPortLock(false);
   }
 
   server.listen(PROXY_PORT, PROXY_HOST, () => {
