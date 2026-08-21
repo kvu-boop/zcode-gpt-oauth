@@ -47,6 +47,10 @@ Tokens are stored at `~/.zcode/gpt-oauth/auth.json`:
 - On first need, if the store is missing/expired, the server imports the existing `openai` OAuth entry from `~/.local/share/opencode/auth.json` (read-only; never modified).
 - Tokens are never logged.
 
+### Windows
+
+Windows requires Node.js to be available in `PATH`. The plugin opens the default browser via `cmd /c start`; tokens are stored at `%USERPROFILE%\.zcode\gpt-oauth\auth.json`.
+
 ## Security notes
 
 - The OAuth **access/refresh tokens are stored in plaintext** on disk in your home directory (0600 permissions). Anyone with access to your account can use your ChatGPT subscription.

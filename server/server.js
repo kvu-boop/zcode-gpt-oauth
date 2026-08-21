@@ -25,7 +25,7 @@ const os = require('os');
 const { spawn } = require('child_process');
 const readline = require('readline');
 
-const VERSION = '0.1.5';
+const VERSION = '0.1.6';
 const NAME = 'gpt-oauth';
 
 // ---------------------------------------------------------------------------
@@ -328,11 +328,15 @@ async function resolveAccount(store) {
 // OAuth login (PKCE, loopback)
 // ---------------------------------------------------------------------------
 function openBrowser(url) {
-  return new Promise((resolve) => {
-    const child = spawn('open', [url], { stdio: 'ignore' });
-    child.on('error', (err) => { log('Failed to open browser: ' + err.message); resolve(); });
-    child.on('exit', () => resolve());
-  });
+  try {
+    if (process.platform === 'win32') {
+      spawn('cmd', ['/c', 'start', '', url], { stdio: 'ignore', detached: true }).on('error', () => {});
+    } else if (process.platform === 'darwin') {
+      spawn('open', [url], { stdio: 'ignore' }).on('error', () => {});
+    } else {
+      spawn('xdg-open', [url], { stdio: 'ignore' }).on('error', () => {});
+    }
+  } catch {}
 }
 
 async function oauthLogin() {
@@ -381,7 +385,9 @@ async function oauthLogin() {
       let gotState = null;
       const timeout = setTimeout(() => {
         try { server.close(); } catch (e) {}
-        reject(new Error('OAuth login timed out after 5 minutes'));
+        const timeoutError = new Error('OAuth login timed out after 5 minutes');
+        timeoutError.manualUrl = authorizeUrl;
+        reject(timeoutError);
       }, OAUTH_MAX_WAIT_MS);
 
       server.on('request', (req, res) => {
@@ -398,7 +404,9 @@ async function oauthLogin() {
           const failHtml = '<!doctype html><html><body style="font-family:sans-serif;text-align:center;margin-top:100px"><h2>Login Failed</h2><p>Invalid or mismatched OAuth callback (code/state). Please try again.</p></body></html>';
           res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
           res.end(failHtml);
-          reject(new Error('OAuth callback code/state mismatch (possible CSRF)'));
+          const callbackError = new Error('OAuth callback code/state mismatch (possible CSRF)');
+          callbackError.manualUrl = authorizeUrl;
+          reject(callbackError);
           return;
         }
         const html = '<!doctype html><html><body style="font-family:sans-serif;text-align:center;margin-top:100px"><h2>Login OK</h2><p>You can close this tab and return to ZCode.</p></body></html>';
@@ -416,7 +424,9 @@ async function oauthLogin() {
               redirect_uri: redirectUri,
             });
             if (token.status < 200 || token.status >= 300) {
-              reject(new Error('token exchange failed with status ' + token.status + ': ' + token.body.slice(0, 200)));
+              const tokenError = new Error('token exchange failed with status ' + token.status + ': ' + token.body.slice(0, 200));
+              tokenError.manualUrl = authorizeUrl;
+              reject(tokenError);
               return;
             }
             const t = JSON.parse(token.body);
@@ -440,6 +450,7 @@ async function oauthLogin() {
             const final = loadStore();
             resolve({ email: final.email, accountId: final.accountId, expires: final.expires, accountError: accountErr });
           } catch (e) {
+            if (!e.manualUrl) e.manualUrl = authorizeUrl;
             reject(e);
           }
         })();
@@ -476,7 +487,8 @@ async function handleTool(name, params) {
           accountError: r.accountError || null,
         });
       } catch (e) {
-        return mcpError('gpt_login failed: ' + e.message);
+        const manual = e.manualUrl ? ` Open this URL manually: ${e.manualUrl}` : '';
+        return mcpError('gpt_login failed: ' + e.message + manual);
       }
     }
     case 'gpt_logout': {
