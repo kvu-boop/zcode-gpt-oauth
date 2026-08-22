@@ -1,7 +1,7 @@
 {
   "name": "gpt-oauth",
   "description": "ChatGPT (GPT Plus) OAuth login and OpenAI-compatible local proxy. Login once via browser (/gpt-oauth:login), then register provider baseURL http://127.0.0.1:8787/v1 in Model settings to use GPT models in subagents without an API key.",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "author": { "name": "kvu" },
   "commands": ["commands"],
   "mcpServers": {

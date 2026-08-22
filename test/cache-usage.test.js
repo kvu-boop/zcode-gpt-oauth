@@ -1,0 +1,5 @@
+'use strict';
+const test=require('node:test'); const assert=require('node:assert/strict'); const {normalizeProviderUsage}=require('../server/cache/adapters');
+test('normalizes OpenAI cache fields and confidence',()=>{const u=normalizeProviderUsage({provider:'openai',schema:'openai-responses',model:'gpt-5.6-sol',rawUsage:{input_tokens:100,output_tokens:4,input_tokens_details:{cached_tokens:40,cache_write_tokens:10}}}); assert.equal(u.cacheTelemetry,'supported'); assert.equal(u.cacheReadTokens.value,40); assert.equal(u.uncachedInputTokens.value,50); assert.equal(u.uncachedInputTokens.confidence,'derived');});
+test('missing cache details remain unknown and null',()=>{const u=normalizeProviderUsage({provider:'deepseek',schema:'deepseek',rawUsage:{prompt_tokens:3,completion_tokens:1}}); assert.equal(u.cacheTelemetry,'unknown'); assert.equal(u.cacheReadTokens,null);});
+test('invalid counts do not become zero',()=>{const u=normalizeProviderUsage({provider:'deepseek',schema:'deepseek',rawUsage:{prompt_tokens:-2,completion_tokens:1,prompt_cache_hit_tokens:0}}); assert.equal(u.inputTokens,null); assert.equal(u.cacheReadTokens.value,0);});

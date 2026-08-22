@@ -45,6 +45,16 @@ What it does:
 
 > After applying, open **Settings → Subagents** and pick the model for each subagent to match **your** providers (e.g. `gpt-5.6-*` models if you set up gpt-oauth with `/gpt-oauth:setup`). The command never reads or prints provider API keys.
 
+## Cache miss notices
+
+Cache analytics is opt-in. Set `GPT_OAUTH_CACHE_MISS_NOTICES=1` before starting the proxy. Requests may include local-only metadata:
+
+```json
+{"cache_control":{"session_id":"session-id","lineage_id":"context-lineage","reset":false,"pricing_tier":"standard","context_band":"short","time_band":"off-peak"}}
+```
+
+The proxy strips `cache_control` before forwarding upstream. Optional `pricing_tier`, `context_band`, and `time_band` selectors are used only when explicitly supplied; they are never inferred. When enabled and successful responses include recognized usage, a top-level `cache_usage` extension is returned (including `uncached_input_tokens`); significant comparable misses also include structured `cache_notice` (on the terminal streaming chunk before `[DONE]`). Comparison requires both identifiers and remains in memory only; no prompt text or identifiers are logged. Missing or unknown metadata is harmless. GPT OAuth subscription traffic never receives fabricated OpenAI Platform USD pricing.
+
 ## Ports
 
 | Port | Purpose |

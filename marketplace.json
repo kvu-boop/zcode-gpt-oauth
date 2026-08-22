@@ -7,7 +7,7 @@
       "name": "gpt-oauth",
       "source": "./",
       "description": "ChatGPT (GPT Plus) OAuth login and OpenAI-compatible local proxy for ZCode",
-      "version": "0.2.3",
+      "version": "0.2.4",
       "author": { "name": "KhanhVu" }
     }
   ]

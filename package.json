@@ -1,0 +1,8 @@
+{
+  "name": "gpt-oauth",
+  "version": "0.2.4",
+  "private": true,
+  "description": "GPT OAuth proxy",
+  "engines": { "node": ">=18" },
+  "scripts": { "test": "node --test" }
+}
