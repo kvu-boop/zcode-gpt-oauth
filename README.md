@@ -47,13 +47,17 @@ What it does:
 
 ## Cache miss notices
 
-Cache analytics is opt-in. Set `GPT_OAUTH_CACHE_MISS_NOTICES=1` before starting the proxy. Requests may include local-only metadata:
+Cache-miss notices are controlled by a persistent setting and are disabled by default. Use the explicit, idempotent commands `/gpt-oauth:cache-miss-on` and `/gpt-oauth:cache-miss-off` to enable or disable them. The command persists the choice under `~/.zcode/gpt-oauth/settings.json`, restarts the detached proxy when needed, and verifies the effective state through `/healthz`; no GUI-process environment setup is required. `/gpt-oauth:status` reports the effective setting.
+
+Advanced users and tests may use `GPT_OAUTH_CACHE_MISS_NOTICES=1` or `0` as a startup environment override. An explicit environment value takes precedence over the persisted setting and cannot be changed by the slash commands while it conflicts; remove the override to manage the setting persistently.
+
+Requests may include local-only metadata:
 
 ```json
 {"cache_control":{"session_id":"session-id","lineage_id":"context-lineage","reset":false,"pricing_tier":"standard","context_band":"short","time_band":"off-peak"}}
 ```
 
-The proxy strips `cache_control` before forwarding upstream. Optional `pricing_tier`, `context_band`, and `time_band` selectors are used only when explicitly supplied; they are never inferred. When enabled and successful responses include recognized usage, a top-level `cache_usage` extension is returned (including `uncached_input_tokens`); significant comparable misses also include structured `cache_notice` (on the terminal streaming chunk before `[DONE]`). Comparison requires both identifiers and remains in memory only; no prompt text or identifiers are logged. Missing or unknown metadata is harmless. GPT OAuth subscription traffic never receives fabricated OpenAI Platform USD pricing.
+The proxy strips `cache_control` before forwarding upstream. Optional `pricing_tier`, `context_band`, and `time_band` selectors are used only when explicitly supplied; they are never inferred. When enabled and successful responses include recognized usage, a top-level `cache_usage` extension is returned (including `uncached_input_tokens`); significant comparable misses also include structured `cache_notice` (on the terminal streaming chunk before `[DONE]`). Enabling this setting does not make ZCode inject `session_id` or `lineage_id`, and the proxy cannot create provider cache telemetry; comparison requires both identifiers and comparable provider telemetry. The setting also does not render notice UI. Comparison remains in memory only; no prompt text or identifiers are logged. Missing or unknown metadata is harmless. GPT OAuth subscription traffic never receives fabricated OpenAI Platform USD pricing.
 
 ## Ports
 
