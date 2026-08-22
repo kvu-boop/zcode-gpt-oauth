@@ -37,7 +37,7 @@ const { resolvePricing } = require('./cache/pricing');
 const { calculateAdditionalCacheMissCost } = require('./cache/cost');
 const { buildCacheNotice } = require('./cache/notice');
 
-const VERSION = '0.2.4';
+const VERSION = '0.2.5';
 const NAME = 'gpt-oauth';
 
 // ---------------------------------------------------------------------------
@@ -60,7 +60,6 @@ const AUTH_BASE = 'https://auth.openai.com/oauth';
 // Overridable so the SSE/streaming tests can point the proxy at a local
 // slow-upstream harness. Default is the production Codex backend.
 const BACKEND_BASE = process.env.GPT_OAUTH_BACKEND_BASE || 'https://chatgpt.com/backend-api/codex';
-const CACHE_MISS_NOTICES = /^(?:1|true|yes|on)$/i.test(String(process.env.GPT_OAUTH_CACHE_MISS_NOTICES || ''));
 const cacheTracker = createTracker();
 const HOME_OVERRIDE = process.env.GPT_OAUTH_HOME || (process.env.NODE_ENV === 'test' ? process.env.HOME : null);
 const PROXY_HOST = process.env.GPT_OAUTH_PROXY_HOST || '127.0.0.1';
@@ -75,7 +74,38 @@ const SCOPE = 'openid profile email offline_access';
 const ZCODE_DIR = path.join(HOME_OVERRIDE || os.homedir(), '.zcode');
 const TOKEN_DIR = path.join(ZCODE_DIR, 'gpt-oauth');
 const TOKEN_FILE = path.join(TOKEN_DIR, 'auth.json');
+const SETTINGS_FILE = path.join(TOKEN_DIR, 'settings.json');
 const OPENCODE_AUTH = path.join(os.homedir(), '.local', 'share', 'opencode', 'auth.json');
+
+function parseBooleanEnv(value) {
+  if (value === undefined || value === null || value === '') return null;
+  if (/^(?:1|true|yes|on)$/i.test(String(value))) return true;
+  if (/^(?:0|false|no|off)$/i.test(String(value))) return false;
+  return null;
+}
+
+function loadSettings() {
+  try {
+    const data = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
+    return data && typeof data === 'object' && !Array.isArray(data) ? data : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+function saveSettings(patch) {
+  const settings = { ...loadSettings(), ...patch };
+  fs.mkdirSync(TOKEN_DIR, { recursive: true });
+  const tmp = SETTINGS_FILE + '.tmp-' + process.pid + '-' + Date.now();
+  fs.writeFileSync(tmp, JSON.stringify(settings, null, 2), { mode: 0o600 });
+  fs.renameSync(tmp, SETTINGS_FILE);
+  fs.chmodSync(SETTINGS_FILE, 0o600);
+  return settings;
+}
+
+const ENV_CACHE_MISS_NOTICES = parseBooleanEnv(process.env.GPT_OAUTH_CACHE_MISS_NOTICES);
+const PERSISTED_CACHE_MISS_NOTICES = loadSettings().cacheMissNotices === true;
+const CACHE_MISS_NOTICES = ENV_CACHE_MISS_NOTICES === null ? PERSISTED_CACHE_MISS_NOTICES : ENV_CACHE_MISS_NOTICES;
 
 const OAUTH_PORT = 1455;
 const OAUTH_MAX_WAIT_MS = 5 * 60 * 1000;
@@ -337,14 +367,39 @@ const SHUTDOWN_URL = `http://${PROXY_HOST}:${PROXY_PORT}/shutdown`;
 
 // GET /healthz; resolves to the running server's version string, or null if the
 // daemon is unreachable (connection refused) or not reporting a version.
-async function daemonHealth(timeoutMs = 2000) {
+async function daemonHealthState(timeoutMs = 2000) {
   try {
     const h = await getJSON(HEALTHZ_URL, {}, timeoutMs);
     if (h.status !== 200) return null;
-    try { return JSON.parse(h.body).version || null; } catch (e) { return null; }
+    const state = JSON.parse(h.body);
+    return state && state.version ? state : null;
   } catch (e) {
     return null;
   }
+}
+
+async function daemonHealth(timeoutMs = 2000) {
+  const state = await daemonHealthState(timeoutMs);
+  return state && state.version || null;
+}
+
+async function restartDaemonForCacheSetting(desired) {
+  const state = await daemonHealthState(2000);
+  if (!state) {
+    const ok = await ensureDaemon();
+    return { restarted: ok, state: await daemonHealthState(2000) };
+  }
+  if (state.cacheMissNotices === desired) return { restarted: false, state };
+  await daemonShutdown();
+  const ok = await ensureDaemon();
+  const finalState = await daemonHealthState(2000);
+  return { restarted: ok, state: finalState };
+}
+
+function effectiveCacheMissNotices() {
+  const env = parseBooleanEnv(process.env.GPT_OAUTH_CACHE_MISS_NOTICES);
+  if (env !== null) return env;
+  return loadSettings().cacheMissNotices === true;
 }
 
 // POST /shutdown with the CSRF-safe custom header, then wait for the port to
@@ -731,6 +786,21 @@ async function handleTool(name, params) {
       clearStore();
       return mcpResult({ ok: true, wasLoggedIn: existed });
     }
+    case 'gpt_cache_miss_notices': {
+      if (typeof params.enabled !== 'boolean') return mcpError('gpt_cache_miss_notices failed: enabled must be a boolean');
+      if (ENV_CACHE_MISS_NOTICES !== null && ENV_CACHE_MISS_NOTICES !== params.enabled) {
+        return mcpError('gpt_cache_miss_notices failed: GPT_OAUTH_CACHE_MISS_NOTICES explicitly overrides the requested setting');
+      }
+      const before = effectiveCacheMissNotices();
+      saveSettings({ cacheMissNotices: params.enabled });
+      if (before === params.enabled) return mcpResult({ ok: true, cacheMissNotices: params.enabled, proxyRestarted: false });
+      const result = await restartDaemonForCacheSetting(params.enabled);
+      const active = result.state && result.state.cacheMissNotices;
+      if (!result.state || active !== params.enabled) {
+        return mcpError('gpt_cache_miss_notices failed: daemon did not report requested state');
+      }
+      return mcpResult({ ok: true, cacheMissNotices: active, proxyRestarted: !!result.restarted });
+    }
     case 'gpt_status': {
       const store = loadStore();
       const updateStatus = await getUpdateStatus();
@@ -756,7 +826,7 @@ async function handleTool(name, params) {
       if (!store) {
         return mcpResult({
           loggedIn: false, email: null, accountId: null, expires: null,
-          accessValid: false, proxyRunning, lastError,
+          accessValid: false, proxyRunning, cacheMissNotices: CACHE_MISS_NOTICES, lastError,
           ...updateStatus,
         });
       }
@@ -767,6 +837,7 @@ async function handleTool(name, params) {
         expires: store.expires,
         accessValid: store.expires > Date.now(),
         proxyRunning,
+        cacheMissNotices: CACHE_MISS_NOTICES,
         lastError,
         ...updateStatus,
       });
@@ -816,6 +887,11 @@ function startMCP() {
               name: 'gpt_logout',
               description: 'Delete the stored OAuth token (forces re-login).',
               inputSchema: { type: 'object', properties: {}, required: [] },
+            },
+            {
+              name: 'gpt_cache_miss_notices',
+              description: 'Enable or disable persistent cache-miss notices.',
+              inputSchema: { type: 'object', properties: { enabled: { type: 'boolean' } }, required: ['enabled'], additionalProperties: false },
             },
             {
               name: 'gpt_status',
@@ -1662,7 +1738,7 @@ function startProxy(onStart, onPortLock) {
         if (method === 'GET' && url.pathname === '/healthz') {
           const store = loadStore();
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: true, version: VERSION, loggedIn: !!(store && store.refresh), modelCount: MODEL_IDS.length }));
+          res.end(JSON.stringify({ ok: true, version: VERSION, loggedIn: !!(store && store.refresh), cacheMissNotices: CACHE_MISS_NOTICES, modelCount: MODEL_IDS.length }));
           return;
         }
         if (method === 'POST' && url.pathname === '/shutdown') {
