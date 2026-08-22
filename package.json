@@ -1,6 +1,6 @@
 {
   "name": "gpt-oauth",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "private": true,
   "description": "GPT OAuth proxy",
   "engines": { "node": ">=18" },

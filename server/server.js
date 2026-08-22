@@ -37,7 +37,7 @@ const { resolvePricing } = require('./cache/pricing');
 const { calculateAdditionalCacheMissCost } = require('./cache/cost');
 const { buildCacheNotice } = require('./cache/notice');
 
-const VERSION = '0.2.5';
+const VERSION = '0.2.6';
 const NAME = 'gpt-oauth';
 
 // ---------------------------------------------------------------------------
@@ -130,6 +130,17 @@ const DAEMON = args.includes('--daemon');
 //                 daemon, so MCP-focused tests have no side effects on the port.
 const RUN_MCP = !HTTP_ONLY && !DAEMON;                    // serve MCP stdio
 const RUN_HTTP = !MCP_ONLY && (DAEMON || HTTP_ONLY);      // bind port 8787
+const DEFAULT_PROXY_PORT = 8787;
+
+// A test process must never accidentally become the production proxy. Keep an
+// explicit port override available for isolated HTTP integration fixtures.
+function refuseTestProductionProxy() {
+  if (process.env.NODE_ENV === 'test' && RUN_HTTP && PROXY_PORT === DEFAULT_PROXY_PORT && !process.env.GPT_OAUTH_PROXY_PORT) {
+    process.stderr.write('REFUSING TO BIND production proxy port 8787 from NODE_ENV=test; set GPT_OAUTH_PROXY_PORT for an isolated test port.\\n');
+    process.exit(1);
+  }
+  return false;
+}
 
 // ---------------------------------------------------------------------------
 // Logging (stderr, except in --daemon mode where it goes to daemon.log)
@@ -384,6 +395,8 @@ async function daemonHealth(timeoutMs = 2000) {
 }
 
 async function restartDaemonForCacheSetting(desired) {
+  // MCP-only sessions must not affect the detached production daemon.
+  if (MCP_ONLY) return { restarted: false, state: null };
   const state = await daemonHealthState(2000);
   if (!state) {
     const ok = await ensureDaemon();
@@ -421,9 +434,18 @@ async function daemonShutdown() {
 // Spawn the detached daemon (uses process.execPath so relative-executable PATH
 // issues from GUI launches don't apply, and __filename is an absolute path).
 function spawnDaemon() {
+  // Detached daemons are production processes, even when launched by a test
+  // or temporary MCP environment. Never inherit test identity, token, or port
+  // overrides. A daemon always uses the real account home for token discovery.
+  const env = { ...process.env };
+  delete env.GPT_OAUTH_HOME;
+  delete env.GPT_OAUTH_PROXY_PORT;
+  if (process.env.NODE_ENV === 'test') env.NODE_ENV = 'production';
+  env.HOME = os.homedir();
   const child = spawn(process.execPath, [__filename, '--daemon'], {
     detached: true,   // new process group / session: survives parent death
     stdio: 'ignore',  // daemon logs go to ~/.zcode/gpt-oauth/daemon.log
+    env,
   });
   child.unref();
   return child;
@@ -794,6 +816,9 @@ async function handleTool(name, params) {
       const before = effectiveCacheMissNotices();
       saveSettings({ cacheMissNotices: params.enabled });
       if (before === params.enabled) return mcpResult({ ok: true, cacheMissNotices: params.enabled, proxyRestarted: false });
+      if (MCP_ONLY) {
+        return mcpResult({ ok: true, cacheMissNotices: params.enabled, proxyRestarted: false });
+      }
       const result = await restartDaemonForCacheSetting(params.enabled);
       const active = result.state && result.state.cacheMissNotices;
       if (!result.state || active !== params.enabled) {
@@ -1918,6 +1943,7 @@ function startProxy(onStart, onPortLock) {
 // Main
 // ---------------------------------------------------------------------------
 async function main() {
+  if (refuseTestProductionProxy()) return;
   log('gpt-oauth server v' + VERSION + ' mode=' + (DAEMON ? 'daemon' : (HTTP_ONLY ? 'http-only' : 'mcp')) + ' http=' + RUN_HTTP + ' mcp=' + RUN_MCP);
   if (DAEMON) {
     // Detached daemon: sole owner of port 8787, logs to daemon.log.

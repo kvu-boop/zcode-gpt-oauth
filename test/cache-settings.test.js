@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
+const http = require('node:http');
 
 const SERVER = path.join(__dirname, '..', 'server', 'server.js');
 function startMcp(home, extra = {}) {
@@ -16,6 +17,27 @@ function startMcp(home, extra = {}) {
 }
 function text(result) { return JSON.parse(result.result.content[0].text); }
 function settings(home) { return path.join(home, '.zcode', 'gpt-oauth', 'settings.json'); }
+function health(port) {
+  return new Promise((resolve) => {
+    const req = http.get({ hostname: '127.0.0.1', port, path: '/healthz' }, (res) => {
+      let body = '';
+      res.on('data', (chunk) => { body += chunk; });
+      res.on('end', () => { try { resolve(JSON.parse(body)); } catch { resolve(null); } });
+    });
+    req.on('error', () => resolve(null));
+    req.setTimeout(500, () => { req.destroy(); resolve(null); });
+  });
+}
+let port8787Before;
+test.before(async () => {
+  const state = await health(8787);
+  port8787Before = { listening: !!state, version: state && state.version };
+});
+test.after(async () => {
+  const state = await health(8787);
+  assert.equal(!!state, port8787Before.listening, 'port 8787 listener state changed during cache settings tests');
+  assert.equal(state && state.version, port8787Before.version, 'port 8787 daemon version changed during cache settings tests');
+});
 
 test('status defaults false and malformed settings do not crash', async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-settings-'));
@@ -35,7 +57,10 @@ test('cache setting preserves unknown keys and auth.json', async () => {
   const mcp = startMcp(home);
   try {
     const r = text(await mcp.call('tools/call', { name: 'gpt_cache_miss_notices', arguments: { enabled: true } }));
-    assert.equal(r.ok, true); assert.equal(r.cacheMissNotices, true);
+    assert.equal(r.ok, true); assert.equal(r.cacheMissNotices, true); assert.equal(r.proxyRestarted, false);
+    const after = await health(8787);
+    assert.equal(!!after, port8787Before.listening);
+    assert.equal(after && after.version, port8787Before.version);
   } finally { mcp.close(); }
   const saved = JSON.parse(fs.readFileSync(settings(home), 'utf8'));
   assert.equal(saved.futureKey, 'kept'); assert.equal(saved.cacheMissNotices, true); assert.equal(fs.readFileSync(auth, 'utf8'), before);

@@ -75,6 +75,8 @@ Since v0.1.9 the HTTP proxy on port `8787` runs inside a **detached daemon proce
 3. **Version takeover happens daemon-vs-daemon.** If the running daemon's `version` is **older** than the code, the new process calls `POST /shutdown` with the `x-gpt-oauth-shutdown: 1` header (a CSRF-safe custom header that ordinary web forms cannot send — without it the endpoint returns `403`), waits for the port to free, spawns its own daemon and takes over. Equal or newer → reuse.
 4. `gpt_status` reports `proxyRunning` (daemon health) and, if the daemon cannot be brought up, `lastError` containing the last 5 lines of `daemon.log`.
 
+The HTTP daemon always runs with the real user's `HOME`, so it discovers tokens and settings from the real `~/.zcode/gpt-oauth/` directory. It must never inherit test environment overrides. Processes started with `--mcp-only` persist their test state without spawning or touching the proxy daemon on port `8787`.
+
 Updating the plugin (via **Settings → Plugin Management → update**, then restart ZCode) requires **no manual process killing** — the recommended flow is unchanged: start the updated version, let it take over from any older instance via the handshake above, and let the daemon re-spawn from the current code.
 
 `/gpt-oauth:status` (`gpt_status`) also reports `latestVersion` and `updateAvailable` (checked against the marketplace, cached for an hour), so you can see when a new release is available.
@@ -135,6 +137,7 @@ A short `first_event` vs `done` proves the client saw data long before the upstr
 - **Model 404 ("model not found on backend")**: the backend may not serve the advertised model. Edit the model list in **Settings → Model settings** for the `gpt-oauth` provider (add one of the working ids from below, or the ones the backend reports).
 - **401 "re-login required"**: run `/gpt-oauth:login` again to re-authenticate.
 - **Proxy not reachable**: any MCP-mode process auto-spawns the daemon on startup, so usually just using the plugin restores it. If it is still down, check the last lines of `~/.zcode/gpt-oauth/daemon.log` and ensure the plugin's MCP server is enabled, then restart ZCode.
+- **`/healthz` shows `loggedIn:false` while `~/.zcode/gpt-oauth/auth.json` is valid**: a stale test daemon may own port `8787`; send `POST /shutdown` with header `x-gpt-oauth-shutdown: 1`, then restart via the plugin lifecycle (`/gpt-oauth:status` or restarting ZCode).
 - **MCP "Reconnecting forever"**: the process now survives unexpected errors (logs to stderr, never exits). If you still see it, restart ZCode once so the new process starts.
 
 ## Verified working model ids
