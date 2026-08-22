@@ -37,7 +37,7 @@ const { resolvePricing } = require('./cache/pricing');
 const { calculateAdditionalCacheMissCost } = require('./cache/cost');
 const { buildCacheNotice } = require('./cache/notice');
 
-const VERSION = '0.2.6';
+const VERSION = '0.2.7';
 const NAME = 'gpt-oauth';
 
 // ---------------------------------------------------------------------------
@@ -117,6 +117,8 @@ const MODEL_OWNED_BY = 'chatgpt-oauth';
 const STREAM_HEADERS_TIMEOUT_MS = 45000;  // upstream response headers must arrive within this
 const STREAM_IDLE_TIMEOUT_MS = 45000;     // upstream must send data this often once headers arrive
 const STREAM_HEARTBEAT_MS = 10000;        // client-side `: keep-alive` SSE comment while streaming
+const SSE_MAX_EVENT_BYTES = 64 * 1024 * 1024;  // abort an upstream SSE event larger than this (OOM guard)
+const MAX_BODY_BYTES = Number(process.env.GPT_OAUTH_MAX_BODY_BYTES) || 256 * 1024 * 1024; // reject request bodies larger than this (OOM guard)
 
 // Which parts of the server run.
 const args = process.argv.slice(2);
@@ -442,11 +444,21 @@ function spawnDaemon() {
   delete env.GPT_OAUTH_PROXY_PORT;
   if (process.env.NODE_ENV === 'test') env.NODE_ENV = 'production';
   env.HOME = os.homedir();
-  const child = spawn(process.execPath, [__filename, '--daemon'], {
+  // Point the daemon's stderr at the REAL daemon.log (independent of any test
+  // HOME override) so a "JavaScript heap out of memory" abort message is never
+  // lost. Falls back to 'ignore' if the log cannot be opened.
+  let stderrFd = null;
+  try {
+    const realLog = path.join(os.homedir(), '.zcode', 'gpt-oauth', 'daemon.log');
+    fs.mkdirSync(path.dirname(realLog), { recursive: true });
+    stderrFd = fs.openSync(realLog, 'a');
+  } catch (e) { /* daemon still runs, just without stderr capture */ }
+  const child = spawn(process.execPath, ['--max-old-space-size=2048', __filename, '--daemon'], {
     detached: true,   // new process group / session: survives parent death
-    stdio: 'ignore',  // daemon logs go to ~/.zcode/gpt-oauth/daemon.log
+    stdio: stderrFd === null ? 'ignore' : ['ignore', 'ignore', stderrFd],
     env,
   });
+  if (stderrFd !== null) { try { fs.closeSync(stderrFd); } catch (e) { /* child keeps its own dup */ } }
   child.unref();
   return child;
 }
@@ -1140,19 +1152,24 @@ function parseSSE(body) {
 // Stateful incremental SSE parser used by the streaming forwarder. Handles TCP
 // splits (partial blocks arriving across `data` events), LF/CRLF line endings,
 // multi-line `data:` fields, `event:` names, non-JSON/comment lines and the
-// `[DONE]` sentinel WITHOUT buffering the entire upstream body.
-function createSSEParser(onEvent, onDone) {
-  let buffer = '';
+// `[DONE]` sentinel WITHOUT buffering the entire upstream body. Line-ending
+// normalization is applied per incoming chunk only (never over the accumulated
+// text), so cost stays linear in the stream size. Events larger than
+// SSE_MAX_EVENT_BYTES put the parser into a dead state via onError.
+function createSSEParser(onEvent, onDone, onError) {
+  let parts = [];  // normalized text pieces of the current, incomplete event
+  let len = 0;     // total bytes of the current incomplete event (cap check)
+  let tail = '';   // last char of the incomplete event, for the '\n' junction check
+  let carry = '';  // a trailing '\r' held until the next chunk arrives
+  let dead = false;
+
   function emitBlock(block) {
-    let data = null;
+    const dataLines = [];
     for (const line of block.split('\n')) {
-      if (line.startsWith('data:')) {
-        const piece = line.slice(5).replace(/^ /, '');
-        data = data === null ? piece : data + '\n' + piece;
-      }
+      if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^ /, ''));
     }
-    if (data === null) return;
-    const trimmed = data.trim();
+    if (!dataLines.length) return;
+    const trimmed = dataLines.join('\n').trim();
     if (!trimmed) return;
     if (trimmed === '[DONE]') {
       if (onDone) onDone();
@@ -1160,21 +1177,81 @@ function createSSEParser(onEvent, onDone) {
     }
     try { onEvent(JSON.parse(trimmed)); } catch (e) { /* skip non-JSON */ }
   }
+
+  function failOversize() {
+    dead = true;
+    parts = [];
+    len = 0;
+    tail = '';
+    if (onError) onError(new Error('upstream SSE event exceeded ' + SSE_MAX_EVENT_BYTES + ' bytes'));
+  }
+
   return {
     push(chunk) {
-      buffer += String(chunk);
-      buffer = buffer.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-      let idx;
-      while ((idx = buffer.indexOf('\n\n')) !== -1) {
-        const block = buffer.slice(0, idx);
-        buffer = buffer.slice(idx + 2);
-        emitBlock(block);
+      if (dead) return;
+      // Resolve a '\r' that straddled the previous chunk boundary, then
+      // normalize CRLF and lone CR to LF inside this chunk only.
+      const raw = String(chunk);
+      let head;
+      if (carry) {
+        head = raw.charAt(0) === '\n' ? '\n' + raw.slice(1) : '\n' + raw;
+        carry = '';
+      } else {
+        head = raw;
       }
+      let norm = '';
+      for (let i = 0; i < head.length; i++) {
+        const c = head.charAt(i);
+        if (c === '\r') {
+          if (i === head.length - 1) {
+            carry = '\r';
+          } else if (head.charAt(i + 1) === '\n') {
+            norm += '\n';
+            i++;
+          } else {
+            norm += '\n';
+          }
+        } else {
+          norm += c;
+        }
+      }
+      // A '\n\n' separator straddling the old/new chunk boundary.
+      let from = 0;
+      if (parts.length && tail === '\n' && norm.charAt(0) === '\n') {
+        emitBlock(parts.join(''));
+        parts = [];
+        len = 0;
+        tail = '';
+        from = 1;
+      }
+      // Slice out any further complete events within the new text.
+      let rest = norm;
+      while (true) {
+        const k = rest.indexOf('\n\n', from);
+        if (k === -1) break;
+        emitBlock((parts.length ? parts.join('') : '') + rest.slice(from, k));
+        parts = [];
+        len = 0;
+        tail = '';
+        rest = rest.slice(k + 2);
+        from = 0;
+      }
+      const leftover = rest.slice(from);
+      if (leftover) {
+        parts.push(leftover);
+        len += leftover.length;
+        tail = leftover.charAt(leftover.length - 1);
+      }
+      if (len > SSE_MAX_EVENT_BYTES) failOversize();
     },
     flush() {
-      if (buffer.trim().length) {
-        const block = buffer;
-        buffer = '';
+      if (dead) return;
+      if (carry) { carry = ''; parts.push('\n'); len += 1; tail = '\n'; } // trailing lone '\r' == newline
+      if (parts.length) {
+        const block = parts.join('');
+        parts = [];
+        len = 0;
+        tail = '';
         emitBlock(block);
       }
     },
@@ -1721,7 +1798,7 @@ async function handleStream(clientRes, clientBody) {
   });
 
   // Incremental upstream SSE -> converted chunks.
-  const parser = createSSEParser(onUpstreamEvent, () => { if (!state.finished) completeStream(); });
+  const parser = createSSEParser(onUpstreamEvent, () => { if (!state.finished) completeStream(); }, (err) => failStream(err));
   upstream = upstreamStream(store, backendBody, {
     onStatus: (status) => {
       state.upstreamStatus = status;
@@ -1755,10 +1832,25 @@ function startProxy(onStart, onPortLock) {
       return;
     }
     const method = req.method;
-    let body = '';
-    req.on('data', (c) => { body += c; });
+    const chunks = [];
+    let bodyBytes = 0;
+    let bodyTooLarge = false;
+    req.on('data', (c) => {
+      bodyBytes += c.length;
+      if (bodyBytes > MAX_BODY_BYTES) {
+        if (!bodyTooLarge) {
+          bodyTooLarge = true;
+          log('POST ' + url.pathname + ' rejected: body exceeds ' + MAX_BODY_BYTES + ' bytes');
+        }
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
     req.on('error', () => { /* ignore client abort mid-body */ });
     req.on('end', async () => {
+      if (bodyTooLarge) return; // socket destroyed; nothing to respond to
+      const body = Buffer.concat(chunks).toString('utf8');
       try {
         if (method === 'GET' && url.pathname === '/healthz') {
           const store = loadStore();
@@ -1947,6 +2039,7 @@ async function main() {
   log('gpt-oauth server v' + VERSION + ' mode=' + (DAEMON ? 'daemon' : (HTTP_ONLY ? 'http-only' : 'mcp')) + ' http=' + RUN_HTTP + ' mcp=' + RUN_MCP);
   if (DAEMON) {
     // Detached daemon: sole owner of port 8787, logs to daemon.log.
+    for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => { log('daemon received ' + sig + '; exiting'); process.exit(0); });
     startProxy((port) => { log('Proxy daemon ready on port ' + port); }, () => {
       // An equal-or-newer daemon already owns the port; this process is
       // redundant (e.g. a version race), so exit quietly.
@@ -1967,6 +2060,14 @@ async function main() {
       }
     }
     startMCP();
+    // Watchdog: periodically re-ensure the daemon so a silently-dying proxy is
+    // revived without waiting for a brand-new MCP process. ensureDaemon is
+    // idempotent (it reuses a healthy daemon), so this is safe to poll.
+    const watchdogMs = Number(process.env.GPT_OAUTH_DAEMON_WATCHDOG_MS || 30000);
+    if (!MCP_ONLY && process.env.NODE_ENV !== 'test' && Number.isFinite(watchdogMs) && watchdogMs > 0) {
+      const t = setInterval(() => { ensureDaemon().catch(() => {}); }, watchdogMs);
+      if (t.unref) t.unref();
+    }
     return;
   }
   if (RUN_HTTP) {
@@ -1974,6 +2075,10 @@ async function main() {
   }
 }
 
-main().catch((e) => {
-  errlog('startup failure: ' + (e && e.stack ? e.stack : String(e)));
-});
+if (require.main === module) {
+  main().catch((e) => {
+    errlog('startup failure: ' + (e && e.stack ? e.stack : String(e)));
+  });
+}
+
+module.exports = { createSSEParser, compareVersions };
