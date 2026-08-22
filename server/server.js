@@ -31,7 +31,13 @@ const os = require('os');
 const { spawn } = require('child_process');
 const readline = require('readline');
 
-const VERSION = '0.2.3';
+const { normalizeProviderUsage } = require('./cache/adapters');
+const { createTracker } = require('./cache/detector');
+const { resolvePricing } = require('./cache/pricing');
+const { calculateAdditionalCacheMissCost } = require('./cache/cost');
+const { buildCacheNotice } = require('./cache/notice');
+
+const VERSION = '0.2.4';
 const NAME = 'gpt-oauth';
 
 // ---------------------------------------------------------------------------
@@ -54,19 +60,23 @@ const AUTH_BASE = 'https://auth.openai.com/oauth';
 // Overridable so the SSE/streaming tests can point the proxy at a local
 // slow-upstream harness. Default is the production Codex backend.
 const BACKEND_BASE = process.env.GPT_OAUTH_BACKEND_BASE || 'https://chatgpt.com/backend-api/codex';
+const CACHE_MISS_NOTICES = /^(?:1|true|yes|on)$/i.test(String(process.env.GPT_OAUTH_CACHE_MISS_NOTICES || ''));
+const cacheTracker = createTracker();
+const HOME_OVERRIDE = process.env.GPT_OAUTH_HOME || (process.env.NODE_ENV === 'test' ? process.env.HOME : null);
+const PROXY_HOST = process.env.GPT_OAUTH_PROXY_HOST || '127.0.0.1';
+const PROXY_PORT = Number(process.env.GPT_OAUTH_PROXY_PORT || 8787);
+
 
 // OAuth flow matching the Codex CLI (opencode-openai-codex-auth).
 const REDIRECT_PATH = '/auth/callback';
 const REDIRECT_HOST = 'localhost';
 const SCOPE = 'openid profile email offline_access';
 
-const ZCODE_DIR = path.join(os.homedir(), '.zcode');
+const ZCODE_DIR = path.join(HOME_OVERRIDE || os.homedir(), '.zcode');
 const TOKEN_DIR = path.join(ZCODE_DIR, 'gpt-oauth');
 const TOKEN_FILE = path.join(TOKEN_DIR, 'auth.json');
 const OPENCODE_AUTH = path.join(os.homedir(), '.local', 'share', 'opencode', 'auth.json');
 
-const PROXY_HOST = '127.0.0.1';
-const PROXY_PORT = 8787;
 const OAUTH_PORT = 1455;
 const OAUTH_MAX_WAIT_MS = 5 * 60 * 1000;
 
@@ -839,6 +849,72 @@ function startMCP() {
 // ---------------------------------------------------------------------------
 // HTTP proxy -> Codex backend
 // ---------------------------------------------------------------------------
+function consumeCacheControl(body) {
+  const control = body && body.cache_control && typeof body.cache_control === 'object' ? body.cache_control : {};
+  if (body && Object.prototype.hasOwnProperty.call(body, 'cache_control')) delete body.cache_control;
+  return {
+    sessionId: typeof control.session_id === 'string' && control.session_id ? control.session_id : null,
+    lineageId: typeof control.lineage_id === 'string' && control.lineage_id ? control.lineage_id : null,
+    reset: control.reset === true,
+    pricingTier: typeof control.pricing_tier === 'string' && control.pricing_tier ? control.pricing_tier : null,
+    contextBand: typeof control.context_band === 'string' && control.context_band ? control.context_band : null,
+    timeBand: typeof control.time_band === 'string' && control.time_band ? control.time_band : null,
+  };
+}
+
+function cacheRequestToken(clientBody) {
+  if (!CACHE_MISS_NOTICES) return null;
+  const c = clientBody._cacheControl || {};
+  return cacheTracker.begin(normalizeProviderUsage({
+    provider: 'chatgpt-oauth', schema: 'openai-responses', model: clientBody.model,
+    rawUsage: null, observedAtMs: Date.now(), sessionId: c.sessionId, lineageId: c.lineageId,
+    pricingTier: c.pricingTier,
+  }), { reset: c.reset });
+}
+
+function cacheAnalytics(rawUsage, clientBody, observedAtMs, token) {
+  if (!CACHE_MISS_NOTICES || !rawUsage) return null;
+  try {
+    const control = clientBody && clientBody._cacheControl || {};
+    const usage = normalizeProviderUsage({
+      provider: 'chatgpt-oauth', schema: 'openai-responses', model: clientBody.model,
+      rawUsage, observedAtMs, sessionId: control.sessionId, lineageId: control.lineageId,
+      pricingTier: control.pricingTier,
+    });
+    const pricing = resolvePricing({ provider: usage.provider, model: usage.model, tier: control.pricingTier, contextBand: control.contextBand, timeBand: control.timeBand, observedAtMs, inputTokens: usage.inputTokens && usage.inputTokens.value });
+    const detection = token ? cacheTracker.preview(token, usage, { reset: control.reset, policy: { enabled: true }, pricingContext: { cost: null } }) : null;
+    if (!detection) return { usage, notice: null };
+    const cost = calculateAdditionalCacheMissCost({ missedTokens: detection.missedTokens, usage, priceResolution: pricing });
+    if (cost) detection.cost = cost;
+    return { usage, notice: buildCacheNotice(detection, pricing) };
+  } catch (e) {
+    return null;
+  }
+}
+
+function cacheUsageExtension(usage) {
+  if (!usage) return null;
+  const out = { provider: usage.provider, model: usage.model, cacheTelemetry: usage.cacheTelemetry, telemetrySchema: usage.telemetrySchema, capabilityId: usage.capabilityId };
+  for (const key of ['inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'cacheMissTokens', 'uncachedInputTokens', 'cacheHitRate']) {
+    if (usage[key]) out[key] = usage[key];
+  }
+  return out;
+}
+
+// Cancellation is deliberately delegated to the detector so stale request
+// tokens cannot clear a newer request's in-flight generation.
+function cancelCacheToken(token) {
+  if (!token) return;
+  if (typeof cacheTracker.cancel === 'function') {
+    cacheTracker.cancel(token);
+    return;
+  }
+  // Compatibility with an older detector loaded by a stale daemon. Preserve
+  // its stale-token guard while releasing only this generation.
+  const record = cacheTracker.records && cacheTracker.records.get(token.id);
+  if (record && record.inFlight && record.inFlight.generation === token.generation) record.inFlight = null;
+}
+
 function buildBackendBody(body) {
   const instructions = [];
   const input = [];
@@ -1195,6 +1271,8 @@ function upstreamStream(store, body, handlers) {
 // Transform a chat.completions request into codex response events / final obj.
 async function doChatCompletion(clientBody) {
   const store = await getAccess();
+  clientBody._cacheControl = clientBody._cacheControl || consumeCacheControl(clientBody);
+  const cacheToken = clientBody._cacheToken || cacheRequestToken(clientBody);
   const backendBody = buildBackendBody(clientBody);
 
   const res = await postBackend(store, backendBody);
@@ -1218,13 +1296,14 @@ async function doChatCompletion(clientBody) {
   }
 
   const events = parseSSE(res.body);
-  return transformEvents(events, clientBody);
+  return transformEvents(events, clientBody, cacheToken);
 }
 
-function transformEvents(events, clientBody) {
+function transformEvents(events, clientBody, cacheToken) {
   let text = '';
   const toolCalls = []; // {id,name,arguments}
   let usage = null;
+  let cacheAnalyticsResult = null;
   let hasError = null;
 
   for (const ev of events) {
@@ -1259,6 +1338,7 @@ function transformEvents(events, clientBody) {
   const hasToolCalls = toolCalls.length > 0;
   const created = Math.floor(Date.now() / 1000);
   const model = clientBody.model;
+  cacheAnalyticsResult = cacheAnalytics(usage, clientBody, Date.now(), cacheToken);
 
   // Accumulated "message pieces" for streaming: 
   // return structured result for aggregation.
@@ -1269,6 +1349,9 @@ function transformEvents(events, clientBody) {
     usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: (promptTokens + completionTokens) },
     created,
     model,
+    cacheUsage: cacheAnalyticsResult && cacheUsageExtension(cacheAnalyticsResult.usage),
+    cacheNotice: cacheAnalyticsResult && cacheAnalyticsResult.notice,
+    cacheAnalyticsResult,
   };
 }
 
@@ -1287,6 +1370,8 @@ function nonStreamReply(agg) {
     model: agg.model,
     choices: [{ index: 0, message, finish_reason: agg.hasToolCalls ? 'tool_calls' : 'stop' }],
     usage: agg.usage,
+    ...(agg.cacheUsage ? { cache_usage: agg.cacheUsage } : {}),
+    ...(agg.cacheNotice ? { cache_notice: agg.cacheNotice } : {}),
   };
 }
 
@@ -1314,10 +1399,14 @@ async function handleStream(clientRes, clientBody) {
   // SSE headers are written.
   let backendBody;
   let store;
+  let cacheToken;
   try {
+    clientBody._cacheControl = clientBody._cacheControl || consumeCacheControl(clientBody);
+    cacheToken = clientBody._cacheToken || cacheRequestToken(clientBody);
     backendBody = buildBackendBody(clientBody);
     store = await getAccess();
   } catch (e) {
+    cancelCacheToken(cacheToken || clientBody._cacheToken);
     const status = e.upstreamStatus || (e.code === 400 ? 400 : 502);
     clientRes.writeHead(status, { 'Content-Type': 'application/json' });
     clientRes.end(JSON.stringify({ error: { message: e.message, type: 'gpt_oauth_error' } }));
@@ -1338,6 +1427,8 @@ async function handleStream(clientRes, clientBody) {
     toolArgs: new Map(),  // call_id -> accumulated arguments
     toolArgsStreamed: new Set(), // call_ids whose args arrived as deltas
     usage: null,
+    cacheAnalytics: null,
+    cacheToken: clientBody._cacheToken || cacheRequestToken(clientBody),
     finished: false,
   };
   let heartbeat = null;
@@ -1345,8 +1436,8 @@ async function handleStream(clientRes, clientBody) {
   let clientClosed = false;
 
   const send = (s) => {
-    if (clientClosed || state.finished) return;
-    try { clientRes.write(s); } catch (e) { /* ignore write-after-close */ }
+    if (clientClosed || state.finished) return false;
+    try { return clientRes.write(s); } catch (e) { return false; }
   };
   const stopHeartbeat = () => { if (heartbeat) { clearInterval(heartbeat); heartbeat = null; } };
 
@@ -1366,6 +1457,10 @@ async function handleStream(clientRes, clientBody) {
 
   const finish = (ok, err) => {
     if (state.finished) return;
+    if (!ok && state.cacheToken) {
+      cancelCacheToken(state.cacheToken);
+      state.cacheToken = null;
+    }
     state.finished = true;
     stopHeartbeat();
     if (upstream) { try { upstream.abort(); } catch (e) { /* ignore */ } upstream = null; }
@@ -1377,11 +1472,25 @@ async function handleStream(clientRes, clientBody) {
       log(`POST /v1/chat/completions stream model=${model} ERROR${status} ${durMs}ms events=${state.events} chunks=${state.chunks}: ${err && err.message ? err.message : err}`);
       global.lastError = err && err.message ? err.message : String(err);
     }
-    try { state.finished = true; clientRes.end(); } catch (e) { /* ignore */ }
+    try {
+      state.finished = true;
+      clientRes.end(() => {
+        if (ok && state.pendingCacheCommit && !clientRes.destroyed && !clientRes.writableAborted && state.cacheToken) {
+          cacheTracker.commit(state.cacheToken, state.pendingCacheCommit, { reset: clientBody._cacheControl.reset });
+          state.cacheToken = null;
+        } else if (!ok) {
+          cancelCacheToken(state.cacheToken);
+          state.cacheToken = null;
+        }
+      });
+    } catch (e) {
+      cancelCacheToken(state.cacheToken);
+      state.cacheToken = null;
+    }
   };
 
   const completeStream = () => {
-    if (state.finished) return;
+    if (state.finished || clientClosed) return;
     const hasToolCalls = state.toolOrder.length > 0;
     let usage;
     if (state.usage) {
@@ -1390,9 +1499,18 @@ async function handleStream(clientRes, clientBody) {
         completion_tokens: state.usage.output_tokens || 0,
         total_tokens: (state.usage.input_tokens || 0) + (state.usage.output_tokens || 0),
       };
+      state.cacheAnalytics = cacheAnalytics(state.usage, clientBody, Date.now(), state.cacheToken);
     }
-    emitChunk({}, hasToolCalls ? 'tool_calls' : 'stop', usage ? { usage } : undefined);
-    if (!state.finished) send('data: [DONE]\n\n');
+    const terminalExtra = usage ? { usage } : {};
+    if (state.cacheAnalytics && state.cacheAnalytics.usage) terminalExtra.cache_usage = cacheUsageExtension(state.cacheAnalytics.usage);
+    if (state.cacheAnalytics && state.cacheAnalytics.notice) terminalExtra.cache_notice = state.cacheAnalytics.notice;
+    emitChunk({}, hasToolCalls ? 'tool_calls' : 'stop', Object.keys(terminalExtra).length ? terminalExtra : undefined);
+    if (!state.finished && send('data: [DONE]\n\n') && state.cacheToken && state.cacheAnalytics && state.cacheAnalytics.usage) {
+      state.pendingCacheCommit = state.cacheAnalytics.usage;
+    } else if (!state.cacheAnalytics || !state.cacheAnalytics.usage) {
+      cancelCacheToken(state.cacheToken);
+      state.cacheToken = null;
+    }
     finish(true);
   };
 
@@ -1493,6 +1611,10 @@ async function handleStream(clientRes, clientBody) {
 
   clientRes.on('close', () => {
     clientClosed = true;
+    if (!state.finished && state.cacheToken) {
+      cancelCacheToken(state.cacheToken);
+      state.cacheToken = null;
+    }
     stopHeartbeat();
     if (upstream) { try { upstream.abort(); } catch (e) { /* ignore */ } upstream = null; }
   });
@@ -1574,16 +1696,39 @@ function startProxy(onStart, onPortLock) {
           }
           const stream = !!parsed.stream;
           try {
+            parsed._cacheControl = consumeCacheControl(parsed);
+            parsed._cacheToken = cacheRequestToken(parsed);
             if (stream) {
               await handleStream(res, parsed);
               return;
             }
             const agg = await doChatCompletion(parsed);
             res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify(nonStreamReply(agg)));
+            const payload = JSON.stringify(nonStreamReply(agg));
+            let responseEnded = false;
+            const cancelIfUncommitted = () => {
+              if (!responseEnded && parsed._cacheToken) {
+                cancelCacheToken(parsed._cacheToken);
+                parsed._cacheToken = null;
+              }
+            };
+            res.once('aborted', cancelIfUncommitted);
+            res.once('close', cancelIfUncommitted);
+            res.once('error', cancelIfUncommitted);
+            res.end(payload, () => {
+              if (!res.destroyed && !res.writableAborted && parsed._cacheToken && agg.cacheAnalyticsResult) {
+                cacheTracker.commit(parsed._cacheToken, agg.cacheAnalyticsResult.usage, { reset: parsed._cacheControl.reset });
+              } else {
+                cancelIfUncommitted();
+              }
+              responseEnded = true;
+              parsed._cacheToken = null;
+            });
             const dur = Number(process.hrtime.bigint() - start) / 1e6;
             log(`POST /v1/chat/completions model=${parsed.model} upstream=200 ${Math.round(dur)}ms`);
           } catch (e) {
+            cancelCacheToken(parsed._cacheToken);
+            parsed._cacheToken = null;
             global.lastError = e.message;
             const status = e.upstreamStatus || (e.code === 400 ? 400 : 502);
             res.writeHead(status, { 'Content-Type': 'application/json' });
