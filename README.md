@@ -1,155 +1,24 @@
 # gpt-oauth
 
-A ZCode plugin that provides ChatGPT (GPT Plus) OAuth login and a local OpenAI-compatible proxy so you can use GPT models in subagents **without an API key** (using your ChatGPT Plus subscription).
+A ZCode plugin that lets you use GPT models with your **ChatGPT Plus subscription** — no API key needed. It handles OAuth login and runs a local OpenAI-compatible proxy at `http://127.0.0.1:8787/v1`.
 
-The plugin is a single Node codebase (zero dependencies, Node >= 18) running as two cooperating processes:
+## Quick usage
 
-- an **MCP stdio server** per session (`gpt_login`, `gpt_logout`, `gpt_status` tools), and
-- a **detached HTTP proxy daemon** on `http://127.0.0.1:8787/v1` that translates Chat Completions into the OpenAI Codex backend and survives MCP-session reaping (see [Architecture & update](#architecture--update)).
+1. Install the plugin from the ZCode marketplace (**Settings → Plugin Management → Discover → +** → paste `https://github.com/kvu-boop/zcode-gpt-oauth` → **Get** → enable it).
+2. Run the initial commands below, in this order:
 
-## Install
+| Command | What it does |
+|---------|--------------|
+| `/gpt-oauth:login` | Opens a browser for ChatGPT OAuth login (waits up to 5 min). |
+| `/gpt-oauth:setup` | Registers the `gpt-oauth` provider + models (`gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`), then restart ZCode. |
+| `/gpt-oauth:status` | Shows login state, token expiry, proxy status, and update info. |
 
-**From the marketplace (recommended):**
+3. In **Settings → Subagents**, pick any of the GPT models and you're done.
 
-1. Open ZCode → **Settings → Plugin Management → Discover → +** → paste the GitHub URL `https://github.com/kvu-boop/zcode-gpt-oauth`.
-2. The **gpt-oauth** plugin card appears → click **Get**.
-3. Enable the plugin so its MCP server starts.
+Optional: `/gpt-oauth:cache-miss-on` / `cache-miss-off` toggle cache-miss notices; `/gpt-oauth:setup-agents` applies the bundled agent preset.
 
-**Fallback — local directory install** (still works): Discover → + → choose **local directory** → select `~/zcode-plugins/gpt-oauth`. This is useful when running from a local checkout.
+## Version
 
-> Note on `.mcp.json`: we use the `"${pluginDir}/server/server.js"` interpolation form (the proven format used by the context7 plugin). If your ZCode version does not interpolate `${pluginDir}`, change the args to the relative path `"server/server.js"` since the plugin cache runs from the plugin root.
+Current version: **v0.2.8** — adds the GPT-6 Astra model and reasoning-effort forwarding (Light / Medium / High / Extra High / Max). Run `/gpt-oauth:status` to check `latestVersion` and `updateAvailable`.
 
-## Usage flow
-
-1. `/gpt-oauth:login` — opens a browser tab for OAuth login to ChatGPT; waits up to 5 minutes. Verifies the proxy (`/healthz`, `/v1/models`) and reports email + expiry.
-2. `/gpt-oauth:status` — shows login state, token expiry, proxy status and last error.
-3. `/gpt-oauth:setup` — adds the `gpt-oauth` provider (baseURL `http://127.0.0.1:8787/v1`, API key `local-proxy`) to ZCode's model settings and registers the models `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, then instructs you to restart ZCode.
-4. In **Settings → Model settings** the provider `gpt-oauth` appears; in **Settings → Subagents** pick any of the GPT models.
-
-## Preset config
-
-Since v0.2.0 the plugin bundles the author's personal ZCode config under `preset/` (`AGENTS.md` + subagent definitions under `preset/agents/`). Run
-
-- `/gpt-oauth:setup-agents` — copies `preset/AGENTS.md` → `~/.zcode/AGENTS.md` and every `preset/agents/*.md` → `~/.zcode/agents/` (**worker**, **ui-expert**, **reviewer**, plus the plan **template**).
-
-The command works on **macOS and Windows**: it detects the platform first and gives both bash (macOS/Linux) and PowerShell (Windows) forms for every shell step, including a pure-python neutralization script (run with `python3`, or `python`/`py -3` on Windows).
-
-What it does:
-
-1. Locates the `preset/` folder inside the installed plugin; if it is missing the plugin is outdated — update it first.
-2. **Backs up** every file that will be overwritten before touching it: `~/.zcode/AGENTS.md` → `~/.zcode/AGENTS.md.bak-<timestamp>` and each existing `~/.zcode/agents/<name>.md` → `~/.zcode/agents/<name>.md.bak-<timestamp>`.
-3. Copies the preset files into place, then **neutralizes model references**: any frontmatter line `model: "custom:<uuid>:<model>"` whose `<uuid>` is not one of *your* configured providers (checked against `~/.zcode/v2/config.json`) is commented out (`# `) so that subagent falls back to the default model. Lines pointing at providers you actually have are left unchanged.
-4. Reports what was applied, the backup paths, and which files were neutralized.
-
-**Roll back** (if you don't like the preset): restore the backups directly, e.g. `cp ~/.zcode/AGENTS.md.bak-<ts> ~/.zcode/AGENTS.md` (repeat for each `~/.zcode/agents/<name>.md.bak-<ts>`).
-
-> After applying, open **Settings → Subagents** and pick the model for each subagent to match **your** providers (e.g. `gpt-6-astra` or the `gpt-5.6-*` models if you set up gpt-oauth with `/gpt-oauth:setup`). The command never reads or prints provider API keys.
-
-## Cache miss notices
-
-Cache-miss notices are controlled by a persistent setting and are disabled by default. Use the explicit, idempotent commands `/gpt-oauth:cache-miss-on` and `/gpt-oauth:cache-miss-off` to enable or disable them. The command persists the choice under `~/.zcode/gpt-oauth/settings.json`, restarts the detached proxy when needed, and verifies the effective state through `/healthz`; no GUI-process environment setup is required. `/gpt-oauth:status` reports the effective setting.
-
-Advanced users and tests may use `GPT_OAUTH_CACHE_MISS_NOTICES=1` or `0` as a startup environment override. An explicit environment value takes precedence over the persisted setting and cannot be changed by the slash commands while it conflicts; remove the override to manage the setting persistently.
-
-Requests may include local-only metadata:
-
-```json
-{"cache_control":{"session_id":"session-id","lineage_id":"context-lineage","reset":false,"pricing_tier":"standard","context_band":"short","time_band":"off-peak"}}
-```
-
-The proxy strips `cache_control` before forwarding upstream. Optional `pricing_tier`, `context_band`, and `time_band` selectors are used only when explicitly supplied; they are never inferred. When enabled and successful responses include recognized usage, a top-level `cache_usage` extension is returned (including `uncached_input_tokens`); significant comparable misses also include structured `cache_notice` (on the terminal streaming chunk before `[DONE]`). Enabling this setting does not make ZCode inject `session_id` or `lineage_id`, and the proxy cannot create provider cache telemetry; comparison requires both identifiers and comparable provider telemetry. The setting also does not render notice UI. Comparison remains in memory only; no prompt text or identifiers are logged. Missing or unknown metadata is harmless. GPT OAuth subscription traffic never receives fabricated OpenAI Platform USD pricing.
-
-## Ports
-
-| Port | Purpose |
-|------|---------|
-| `8787` | HTTP proxy (OpenAI-compatible Chat Completions). Binds loopback only. |
-| `1455` | OAuth callback loopback server during login (falls back to a random port if busy). |
-
-## Architecture & update
-
-Since v0.1.9 the HTTP proxy on port `8787` runs inside a **detached daemon process** (`server.js --daemon`), *not* inside the per-session MCP stdio process:
-
-1. **The daemon owns the port independently of MCP sessions.** When ZCode reaps an idle session it kills the MCP stdio process, but the daemon is in its own process group (a new session), so port `8787` stays up. The next session finds the proxy already running — no slow "reconnect after idle".
-2. **Any MCP-mode process auto-(re)spawns the daemon if it is missing.** On startup each MCP process calls `GET /healthz`; if the daemon is unreachable it spawns `node server.js --daemon` (detached, `stdio: ignore`, logs to `~/.zcode/gpt-oauth/daemon.log`, kept to the last ~1&nbsp;MB), then polls `/healthz` every 400&nbsp;ms for up to 20&nbsp;s before starting MCP stdio.
-3. **Version takeover happens daemon-vs-daemon.** If the running daemon's `version` is **older** than the code, the new process calls `POST /shutdown` with the `x-gpt-oauth-shutdown: 1` header (a CSRF-safe custom header that ordinary web forms cannot send — without it the endpoint returns `403`), waits for the port to free, spawns its own daemon and takes over. Equal or newer → reuse.
-4. `gpt_status` reports `proxyRunning` (daemon health) and, if the daemon cannot be brought up, `lastError` containing the last 5 lines of `daemon.log`.
-
-The HTTP daemon always runs with the real user's `HOME`, so it discovers tokens and settings from the real `~/.zcode/gpt-oauth/` directory. It must never inherit test environment overrides. Processes started with `--mcp-only` persist their test state without spawning or touching the proxy daemon on port `8787`.
-
-Updating the plugin (via **Settings → Plugin Management → update**, then restart ZCode) requires **no manual process killing** — the recommended flow is unchanged: start the updated version, let it take over from any older instance via the handshake above, and let the daemon re-spawn from the current code.
-
-`/gpt-oauth:status` (`gpt_status`) also reports `latestVersion` and `updateAvailable` (checked against the marketplace, cached for an hour), so you can see when a new release is available.
-
-## Image input
-
-The proxy accepts **both text and image input**. In Chat Completions, `user` message parts with `{"type":"image_url","image_url":{"url": ...}}` are forwarded as `input_image`. `data:image/...;base64,...` URLs pass through unchanged and `http(s)` URLs are passed through for the backend to validate. The model entries this plugin registers advertise `modalities.input: ["text", "image"]`.
-
-## Token storage
-
-Tokens are stored at `~/.zcode/gpt-oauth/auth.json`:
-
-```json
-{ "access": "...", "refresh": "...", "expires": 0, "accountId": "...", "email": "...", "savedAt": 0 }
-```
-
-- Written atomically (tmp file + rename), dir auto-created.
-- On first need, if the store is missing/expired, the server imports the existing `openai` OAuth entry from `~/.local/share/opencode/auth.json` (read-only; never modified).
-- Tokens are never logged.
-
-### Windows
-
-Windows requires Node.js to be available in `PATH`. The plugin opens the default browser via `rundll32 url.dll,FileProtocolHandler` (avoiding `cmd.exe` ampersand query parsing), with `explorer` as a fallback. If the browser does not open, the login result includes the authorize URL so you can open it manually. Tokens are stored at `%USERPROFILE%\.zcode\gpt-oauth\auth.json`.
-
-## Security notes
-
-- The OAuth **access/refresh tokens are stored in plaintext** on disk in your home directory (0600 permissions). Anyone with access to your account can use your ChatGPT subscription.
-- Using ChatGPT Plus via the Codex backend through this proxy is a **terms-of-service grey area** — you acknowledge this risk by using the plugin.
-- The proxy binds to loopback only (`127.0.0.1`).
-
-## Troubleshooting
-
-### Streaming (since v0.2.2)
-
-Streaming responses (`stream: true`) are forwarded **incrementally and token-by-token** from the Codex backend to the client:
-
-- Client `text/event-stream` headers are written immediately (and flushed) before the upstream is even contacted, and a `role` chunk is emitted first.
-- Each upstream `response.output_text.delta` is converted to a standard `chat.completion.chunk` and written **as soon as it arrives**; tool-call items are emitted in valid Chat Completions chunk format, followed by `finish_reason`, `usage` (when the backend reports it) and a final `data: [DONE]`.
-- A `: keep-alive` SSE comment is sent every 10&nbsp;s while the upstream is active, so OpenAI-compatible clients never idle-timeout into long "Reconnecting..." waits during long generations.
-- Upstream failures are bounded and explicit: a JSON error is returned if the failure happens before client headers; after headers the client gets an SSE error chunk followed by `data: [DONE]`. Response headers must arrive within 45&nbsp;s (otherwise 504), and the upstream must keep sending data at least every 45&nbsp;s or the stream terminates cleanly.
-
-The old v0.2.1 behavior buffered the whole upstream body and only re-emitted chunks after the model finished — that looked like a hang to clients and caused the long "Reconnecting..." waits after idle.
-
-### Streaming diagnostics
-
-Each streaming request is tracked with concise lines in `~/.zcode/gpt-oauth/daemon.log` (or stderr in non-daemon mode):
-
-```
-POST /v1/chat/completions stream model=gpt-5.6-sol start
-POST /v1/chat/completions stream model=gpt-5.6-sol upstream headers 200 (312ms)
-POST /v1/chat/completions stream model=gpt-5.6-sol done 6421ms upstream_headers=312ms first_event=359ms events=38 chunks=40
-```
-
-A short `first_event` vs `done` proves the client saw data long before the upstream finished. Timeouts/errors appear as `ERROR status=504/502 ...` with the reason (`upstream headers timeout` / `upstream idle timeout`).
-
-### Other issues
-
-- **Model 404 ("model not found on backend")**: the backend may not serve the advertised model. Edit the model list in **Settings → Model settings** for the `gpt-oauth` provider (add one of the working ids from below, or the ones the backend reports).
-- **401 "re-login required"**: run `/gpt-oauth:login` again to re-authenticate.
-- **Proxy not reachable**: any MCP-mode process auto-spawns the daemon on startup, so usually just using the plugin restores it. If it is still down, check the last lines of `~/.zcode/gpt-oauth/daemon.log` and ensure the plugin's MCP server is enabled, then restart ZCode.
-- **`/healthz` shows `loggedIn:false` while `~/.zcode/gpt-oauth/auth.json` is valid**: a stale test daemon may own port `8787`; send `POST /shutdown` with header `x-gpt-oauth-shutdown: 1`, then restart via the plugin lifecycle (`/gpt-oauth:status` or restarting ZCode).
-- **MCP "Reconnecting forever"**: the process now survives unexpected errors (logs to stderr, never exits). If you still see it, restart ZCode once so the new process starts.
-
-## Verified working model ids
-
-The proxy always advertises `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna` in `/v1/models`. `gpt-6-astra` is verified working on this machine (returned `200` with real generation through the proxy; reasoning efforts `low`/`xhigh`/`max` verified against the backend on 2026-09-08), as are all three `gpt-5.6-*` models (each returned `200` with real generation). The legacy `gpt-5.x-codex*` ids are **not** supported when using Codex with a ChatGPT account (backend returns 400: "model is not supported when using Codex with a ChatGPT account"), so prefer `gpt-6-astra` or the `gpt-5.6-*` family through this proxy.
-
-### Think levels (gpt-6-astra)
-
-`gpt-6-astra` supports reasoning efforts shown in the UI as Light / Medium / High / Extra High / Max, sent by clients as `reasoning_effort`: `low` / `medium` / `high` / `xhigh` / `max`.
-
-Since v0.2.8 the proxy forwards a valid `reasoning_effort` to the backend as `reasoning: {effort, summary: "auto"}` plus `include: ["reasoning.encrypted_content"]` (request format matches opencode v1.18.29; verified against the ChatGPT Codex backend on 2026-09-08).
-
-Requests with no `reasoning_effort` (or an unrecognized value) are forwarded exactly as before — the `gpt-5.6-*` flow is unchanged.
-
-To get the think-level picker for an existing install, re-run `/gpt-oauth:setup` (it only adds missing models) or add the `reasoning` block to the model entry in **Settings → Model settings**.
+Thanks for stopping by and using this plugin!
