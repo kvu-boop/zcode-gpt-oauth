@@ -33,6 +33,7 @@ Register the gpt-oauth local proxy as an OpenAI-compatible provider in ZCode's m
   },
   "source": "custom",
   "models": {
+    "gpt-6-astra":  { "reasoning": { "enabled": true, "variants": ["low", "medium", "high", "xhigh", "max"], "defaultVariant": "high" }, "limit": { "context": 256000, "output": 128000 }, "modalities": { "input": ["text", "image"], "output": ["text"] } },
     "gpt-5.6-sol":  { "limit": { "context": 256000, "output": 128000 }, "modalities": { "input": ["text", "image"], "output": ["text"] } },
     "gpt-5.6-terra":{ "limit": { "context": 256000, "output": 128000 }, "modalities": { "input": ["text", "image"], "output": ["text"] } },
     "gpt-5.6-luna": { "limit": { "context": 256000, "output": 128000 }, "modalities": { "input": ["text", "image"], "output": ["text"] } }
@@ -54,6 +55,6 @@ If the provider entry disappears because the app overwrote `config.json`, guide 
 - Kind: OpenAI-compatible
 - Base URL: `http://127.0.0.1:8787/v1`
 - API key: `local-proxy`
-- Add models: `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`.
+- Add models: `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`.
 
 Do not print raw tokens or secrets.

@@ -23,7 +23,7 @@ The plugin is a single Node codebase (zero dependencies, Node >= 18) running as 
 
 1. `/gpt-oauth:login` — opens a browser tab for OAuth login to ChatGPT; waits up to 5 minutes. Verifies the proxy (`/healthz`, `/v1/models`) and reports email + expiry.
 2. `/gpt-oauth:status` — shows login state, token expiry, proxy status and last error.
-3. `/gpt-oauth:setup` — adds the `gpt-oauth` provider (baseURL `http://127.0.0.1:8787/v1`, API key `local-proxy`) to ZCode's model settings and registers the models `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, then instructs you to restart ZCode.
+3. `/gpt-oauth:setup` — adds the `gpt-oauth` provider (baseURL `http://127.0.0.1:8787/v1`, API key `local-proxy`) to ZCode's model settings and registers the models `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, then instructs you to restart ZCode.
 4. In **Settings → Model settings** the provider `gpt-oauth` appears; in **Settings → Subagents** pick any of the GPT models.
 
 ## Preset config
@@ -43,7 +43,7 @@ What it does:
 
 **Roll back** (if you don't like the preset): restore the backups directly, e.g. `cp ~/.zcode/AGENTS.md.bak-<ts> ~/.zcode/AGENTS.md` (repeat for each `~/.zcode/agents/<name>.md.bak-<ts>`).
 
-> After applying, open **Settings → Subagents** and pick the model for each subagent to match **your** providers (e.g. `gpt-5.6-*` models if you set up gpt-oauth with `/gpt-oauth:setup`). The command never reads or prints provider API keys.
+> After applying, open **Settings → Subagents** and pick the model for each subagent to match **your** providers (e.g. `gpt-6-astra` or the `gpt-5.6-*` models if you set up gpt-oauth with `/gpt-oauth:setup`). The command never reads or prints provider API keys.
 
 ## Cache miss notices
 
@@ -142,4 +142,14 @@ A short `first_event` vs `done` proves the client saw data long before the upstr
 
 ## Verified working model ids
 
-The proxy always advertises `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna` in `/v1/models`, and all three work on this machine (each returned `200` with real generation). The legacy `gpt-5.x-codex*` ids are **not** supported when using Codex with a ChatGPT account (backend returns 400: "model is not supported when using Codex with a ChatGPT account"), so prefer the `gpt-5.6-*` family through this proxy.
+The proxy always advertises `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna` in `/v1/models`. `gpt-6-astra` is verified working on this machine (returned `200` with real generation through the proxy; reasoning efforts `low`/`xhigh`/`max` verified against the backend on 2026-09-08), as are all three `gpt-5.6-*` models (each returned `200` with real generation). The legacy `gpt-5.x-codex*` ids are **not** supported when using Codex with a ChatGPT account (backend returns 400: "model is not supported when using Codex with a ChatGPT account"), so prefer `gpt-6-astra` or the `gpt-5.6-*` family through this proxy.
+
+### Think levels (gpt-6-astra)
+
+`gpt-6-astra` supports reasoning efforts shown in the UI as Light / Medium / High / Extra High / Max, sent by clients as `reasoning_effort`: `low` / `medium` / `high` / `xhigh` / `max`.
+
+Since v0.2.8 the proxy forwards a valid `reasoning_effort` to the backend as `reasoning: {effort, summary: "auto"}` plus `include: ["reasoning.encrypted_content"]` (request format matches opencode v1.18.29; verified against the ChatGPT Codex backend on 2026-09-08).
+
+Requests with no `reasoning_effort` (or an unrecognized value) are forwarded exactly as before — the `gpt-5.6-*` flow is unchanged.
+
+To get the think-level picker for an existing install, re-run `/gpt-oauth:setup` (it only adds missing models) or add the `reasoning` block to the model entry in **Settings → Model settings**.

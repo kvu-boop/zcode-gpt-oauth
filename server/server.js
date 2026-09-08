@@ -37,7 +37,7 @@ const { resolvePricing } = require('./cache/pricing');
 const { calculateAdditionalCacheMissCost } = require('./cache/cost');
 const { buildCacheNotice } = require('./cache/notice');
 
-const VERSION = '0.2.7';
+const VERSION = '0.2.8';
 const NAME = 'gpt-oauth';
 
 // ---------------------------------------------------------------------------
@@ -110,8 +110,13 @@ const CACHE_MISS_NOTICES = ENV_CACHE_MISS_NOTICES === null ? PERSISTED_CACHE_MIS
 const OAUTH_PORT = 1455;
 const OAUTH_MAX_WAIT_MS = 5 * 60 * 1000;
 
-const MODEL_IDS = ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'];
+const MODEL_IDS = ['gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'];
 const MODEL_OWNED_BY = 'chatgpt-oauth';
+
+// Efforts accepted by the ChatGPT Codex backend for gpt-6-astra (matches
+// opencode v1.18.29 reasoning_options). Anything else is dropped so requests
+// without a valid effort keep the exact pre-astra wire format.
+const REASONING_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
 
 // Streaming (v0.2.2): bounds for the incremental SSE forwarder.
 const STREAM_HEADERS_TIMEOUT_MS = 45000;  // upstream response headers must arrive within this
@@ -1124,6 +1129,8 @@ function buildBackendBody(body) {
     input: input,
     tools: tools.length ? tools : undefined,
     stream: true,
+    reasoning: REASONING_EFFORTS.has(body.reasoning_effort) ? { effort: body.reasoning_effort, summary: 'auto' } : undefined,
+    include: REASONING_EFFORTS.has(body.reasoning_effort) ? ['reasoning.encrypted_content'] : undefined,
     store: false,
   };
 }
