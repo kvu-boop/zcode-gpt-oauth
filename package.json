@@ -1,8 +1,8 @@
 {
   "name": "gpt-oauth",
-  "version": "0.2.8",
+  "version": "0.3.2",
   "private": true,
-  "description": "GPT OAuth proxy",
+  "description": "ChatGPT and xAI Grok OAuth proxy",
   "engines": { "node": ">=18" },
   "scripts": { "test": "node --test" }
 }
