@@ -202,6 +202,66 @@ test('xAI stream returns bounded JSON for non-2xx and JSON for header timeout', 
   assert.equal(JSON.parse(timeout.body).error.type, 'gpt_oauth_error');
 });
 
+// Regression for the v0.3.1 incident: an upstream pause longer than Node's
+// implicit 5s keep-alive socket timeout must NOT be fatal. The proxy used to
+// register `req.once('timeout')` and inject an error frame into an already-open
+// SSE stream (or answer 504 for non-streaming), because Node's socket 'timeout'
+// is only a notification. The stall below (6000ms) is deliberately longer than
+// the 5s Node default; the proxy's own idle bound stays at its default 45s so it
+// cannot win the race and mask the defect.
+const NODE_KEEPALIVE_STALL_MS = 6000;
+
+test('xAI stream survives an upstream pause longer than the 5s Node socket default', async (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-oauth-proxy-slow-stream-'));
+  writeToken(home);
+  const newline = String.fromCharCode(10);
+  const api = http.createServer((req, res) => {
+    req.resume(); req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write('data: {"id":"slow","choices":[{"delta":{"role":"assistant"}}]}' + newline + newline);
+      res.write('data: {"id":"slow","choices":[{"delta":{"content":"thinking"}}]}' + newline + newline);
+      setTimeout(() => res.end('data: [DONE]' + newline + newline), NODE_KEEPALIVE_STALL_MS);
+    });
+  });
+  const apiPort = await listen(api);
+  const proxyPort = await new Promise((resolve) => { const s = netServer(); s.listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => resolve(p)); }); });
+  const child = await startProxy({ NODE_ENV: 'test', HOME: home, GPT_OAUTH_HOME: home, GPT_OAUTH_PROXY_PORT: String(proxyPort), XAI_OAUTH_API_BASE: `http://127.0.0.1:${apiPort}/v1`, GPT_OAUTH_STREAM_IDLE_TIMEOUT_MS: '45000', GPT_OAUTH_STREAM_HEADERS_TIMEOUT_MS: '45000', GPT_OAUTH_STREAM_HEARTBEAT_MS: '2000' });
+  t.after(async () => { await stop(child); await close(api); });
+  const started = Date.now();
+  const stream = await request(proxyPort, 'POST', '/v1/chat/completions', { model: GROK, stream: true, messages: [{ role: 'user', content: 'slow' }] });
+  const elapsed = Date.now() - started;
+  assert.equal(stream.status, 200, stream.body);
+  assert.doesNotMatch(stream.body, /data: \{"error"/);
+  assert.doesNotMatch(stream.body, /xAI upstream timeout/);
+  assert.match(stream.body, /thinking/);
+  assert.match(stream.body, /data: \[DONE\]/);
+  assert.ok(elapsed >= NODE_KEEPALIVE_STALL_MS, `stream returned after ${elapsed}ms; the upstream stall was not actually exercised`);
+});
+
+test('xAI non-streaming request survives an upstream pause longer than the 5s Node socket default', async (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-oauth-proxy-slow-json-'));
+  writeToken(home);
+  const api = http.createServer((req, res) => {
+    req.resume(); req.on('end', () => {
+      setTimeout(() => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ id: 'slow', object: 'chat.completion', choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }] }));
+      }, NODE_KEEPALIVE_STALL_MS);
+    });
+  });
+  const apiPort = await listen(api);
+  const proxyPort = await new Promise((resolve) => { const s = netServer(); s.listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => resolve(p)); }); });
+  const child = await startProxy({ NODE_ENV: 'test', HOME: home, GPT_OAUTH_HOME: home, GPT_OAUTH_PROXY_PORT: String(proxyPort), XAI_OAUTH_API_BASE: `http://127.0.0.1:${apiPort}/v1`, GPT_OAUTH_STREAM_IDLE_TIMEOUT_MS: '45000', GPT_OAUTH_STREAM_HEADERS_TIMEOUT_MS: '45000' });
+  t.after(async () => { await stop(child); await close(api); });
+  const started = Date.now();
+  const result = await request(proxyPort, 'POST', '/v1/chat/completions', { model: GROK, messages: [{ role: 'user', content: 'slow' }] });
+  const elapsed = Date.now() - started;
+  assert.equal(result.status, 200, result.body);
+  assert.doesNotMatch(result.body, /xAI upstream timeout/);
+  assert.equal(JSON.parse(result.body).choices[0].message.content, 'ok');
+  assert.ok(elapsed >= NODE_KEEPALIVE_STALL_MS, `request returned after ${elapsed}ms; the upstream stall was not actually exercised`);
+});
+
 test('xAI non-stream oversized upstream errors stay bounded', async (t) => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-oauth-proxy-nonstream-error-'));
   writeToken(home);

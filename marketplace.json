@@ -7,7 +7,7 @@
       "name": "gpt-oauth",
       "source": "./",
       "description": "ChatGPT and xAI Grok OAuth login with an OpenAI-compatible local proxy for ZCode",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "author": { "name": "KhanhVu" }
     }
   ]

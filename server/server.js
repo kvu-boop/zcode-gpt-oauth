@@ -38,7 +38,7 @@ const { calculateAdditionalCacheMissCost } = require('./cache/cost');
 const { buildCacheNotice } = require('./cache/notice');
 const { createXaiAuth } = require('./xai-oauth');
 
-const VERSION = '0.3.1';
+const VERSION = '0.3.2';
 const NAME = 'gpt-oauth';
 
 // ---------------------------------------------------------------------------
@@ -1530,10 +1530,31 @@ function xaiBody(body) {
   return JSON.stringify(copy);
 }
 
+// Log lines must stay single-line; upstream error text can carry newlines.
+// Never pass tokens, Authorization headers or prompt/message content here.
+function oneLine(value, max = 300) {
+  return String(value === null || value === undefined ? '' : value).replace(/[\r\n]+/g, ' ').slice(0, max);
+}
+
+// Node's default keep-alive agent arms a 5000ms socket inactivity timeout, whose
+// `'timeout'` event is a *notification* only — it does not abort the request. A
+// reasoning model such as grok-4.6 routinely pauses longer than that between
+// reasoning phases, so the socket timer must never be treated as fatal. Both xAI
+// paths therefore pin `timeout: 0` (verified to land on the socket, i.e.
+// `socket.timeout === 0`) and rely solely on the explicit headers/idle timers
+// (STREAM_HEADERS_TIMEOUT_MS / STREAM_IDLE_TIMEOUT_MS) to terminate dead upstreams.
+const XAI_SOCKET_TIMEOUT_MS = 0;
+
+// Terminal status a failed xAI request reports (matches the pre-existing defaults).
+function xaiErrorStatus(err) { return (err && err.upstreamStatus) || 502; }
+
 function xaiRequest(store, body, retry = true) {
   return new Promise((resolve, reject) => {
     const u = new URL(`${XAI_API_BASE}/chat/completions`);
     const json = xaiBody(body);
+    const model = body && body.model;
+    const startedAt = Date.now();
+    const nowMs = () => Date.now() - startedAt;
     const headers = {
       Authorization: 'Bearer ' + store.access,
       'Content-Type': 'application/json',
@@ -1565,8 +1586,9 @@ function xaiRequest(store, body, retry = true) {
       resolve(value);
     };
     const timeoutError = (message, status) => Object.assign(new Error(message), { upstreamStatus: status });
-    req = driverFor(u).request({ hostname: u.hostname, port: u.port || (u.protocol === 'https:' ? 443 : 80), path: u.pathname + u.search, method: 'POST', headers }, (res) => {
+    req = driverFor(u).request({ hostname: u.hostname, port: u.port || (u.protocol === 'https:' ? 443 : 80), path: u.pathname + u.search, method: 'POST', headers, timeout: XAI_SOCKET_TIMEOUT_MS }, (res) => {
       response = res;
+      log(`POST /v1/chat/completions xai model=${model} upstream headers ${res.statusCode} (${nowMs()}ms)`);
       if (headersTimer) { clearTimeout(headersTimer); headersTimer = null; }
       const chunks = [];
       const errorChunks = [];
@@ -1601,6 +1623,7 @@ function xaiRequest(store, body, retry = true) {
         if (settled) return;
         cleanup();
         if (res.statusCode === 401 && retry) {
+          log(`POST /v1/chat/completions xai model=${model} upstream 401 -> refresh & retry`);
           try {
             await xaiAuth.refresh();
             const refreshed = xaiAuth.load();
@@ -1620,17 +1643,15 @@ function xaiRequest(store, body, retry = true) {
       try { req.destroy(error); } catch (_) { /* best effort */ }
     }, STREAM_HEADERS_TIMEOUT_MS);
     if (headersTimer.unref) headersTimer.unref();
-    req.once('timeout', () => {
-      const error = timeoutError('xAI upstream timeout', 504);
-      finishError(error);
-      req.destroy(error);
-    });
     req.once('error', finishError);
     req.end(json);
   });
 }
 
 function xaiStream(clientReq, clientRes, body) {
+  const model = body && body.model;
+  const startedAt = Date.now();
+  const nowMs = () => Date.now() - startedAt;
   let attempt = 0;
   let upstream = null;
   let headersTimer = null;
@@ -1639,6 +1660,8 @@ function xaiStream(clientReq, clientRes, body) {
   let settled = false;
   let clientHeadersSent = false;
   let upstreamResponse = null;
+  let chunksSeen = 0;   // upstream data frames forwarded (cheap, no SSE parsing)
+  let bytesSeen = 0;
 
   const cleanupTimers = () => {
     if (headersTimer) { clearTimeout(headersTimer); headersTimer = null; }
@@ -1657,9 +1680,11 @@ function xaiStream(clientReq, clientRes, body) {
     settled = true;
     cleanupTimers();
     destroyUpstream();
+    const durMs = nowMs();
     if (err) {
+      log(`POST /v1/chat/completions xai stream model=${model} ERROR status=${xaiErrorStatus(err)} ${durMs}ms chunks=${chunksSeen} bytes=${bytesSeen}: ${oneLine(err && err.message ? err.message : err)}`);
       if (!clientHeadersSent) {
-        const status = err.upstreamStatus || 502;
+        const status = xaiErrorStatus(err);
         try {
           if (!clientRes.headersSent) clientRes.writeHead(status, { 'Content-Type': 'application/json' });
           if (!clientRes.writableEnded) clientRes.end(JSON.stringify(errorPayload(err)));
@@ -1674,6 +1699,7 @@ function xaiStream(clientReq, clientRes, body) {
       }
       return;
     }
+    log(`POST /v1/chat/completions xai stream model=${model} done ${durMs}ms chunks=${chunksSeen} bytes=${bytesSeen}`);
     try { if (!clientRes.writableEnded) clientRes.end(); } catch (_) { /* client disconnected */ }
   };
   const fail = (err) => finish(err instanceof Error ? err : new Error(String(err || 'xAI upstream error')));
@@ -1682,13 +1708,15 @@ function xaiStream(clientReq, clientRes, body) {
       if (settled) return;
       const u = new URL(`${XAI_API_BASE}/chat/completions`);
       const json = xaiBody(body);
-      const request = driverFor(u).request({ hostname: u.hostname, port: u.port || (u.protocol === 'https:' ? 443 : 80), path: u.pathname + u.search, method: 'POST', headers: { Authorization: 'Bearer ' + access, 'Content-Type': 'application/json', Accept: 'text/event-stream', 'User-Agent': 'zcode-gpt-oauth/' + VERSION, 'Content-Length': Buffer.byteLength(json) } }, (res) => {
+      const request = driverFor(u).request({ hostname: u.hostname, port: u.port || (u.protocol === 'https:' ? 443 : 80), path: u.pathname + u.search, method: 'POST', headers: { Authorization: 'Bearer ' + access, 'Content-Type': 'application/json', Accept: 'text/event-stream', 'User-Agent': 'zcode-gpt-oauth/' + VERSION, 'Content-Length': Buffer.byteLength(json) }, timeout: XAI_SOCKET_TIMEOUT_MS }, (res) => {
         upstreamResponse = res;
         if (headersTimer) { clearTimeout(headersTimer); headersTimer = null; }
+        log(`POST /v1/chat/completions xai stream model=${model} upstream headers ${res.statusCode} (${nowMs()}ms)`);
         idleTimer = setTimeout(() => fail(Object.assign(new Error('xAI upstream idle timeout'), { upstreamStatus: 502 })), STREAM_IDLE_TIMEOUT_MS);
         if (idleTimer.unref) idleTimer.unref();
         const resetIdle = () => { if (idleTimer) idleTimer.refresh(); };
         if (res.statusCode === 401 && attempt++ === 0) {
+          log(`POST /v1/chat/completions xai stream model=${model} upstream 401 -> refresh & retry`);
           res.on('data', resetIdle);
           res.once('end', () => {
             if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
@@ -1736,6 +1764,8 @@ function xaiStream(clientReq, clientRes, body) {
         if (heartbeat.unref) heartbeat.unref();
         res.on('data', (chunk) => {
           if (settled) return;
+          chunksSeen++;
+          bytesSeen += chunk.length;
           if (idleTimer) idleTimer.refresh();
           try { clientRes.write(chunk); } catch (error) { fail(error); }
         });
@@ -1751,7 +1781,6 @@ function xaiStream(clientReq, clientRes, body) {
       upstream = request;
       headersTimer = setTimeout(() => fail(Object.assign(new Error('xAI upstream headers timeout'), { upstreamStatus: 504 })), STREAM_HEADERS_TIMEOUT_MS);
       if (headersTimer.unref) headersTimer.unref();
-      request.once('timeout', () => fail(Object.assign(new Error('xAI upstream timeout'), { upstreamStatus: 504 })));
       request.once('error', fail);
       request.end(json);
     }).catch(fail);
@@ -1759,6 +1788,7 @@ function xaiStream(clientReq, clientRes, body) {
   const onClientAbort = () => { if (!settled) { settled = true; cleanupTimers(); destroyUpstream(); } };
   clientReq.once('aborted', onClientAbort);
   clientRes.once('close', () => { if (!clientRes.writableEnded) onClientAbort(); });
+  log(`POST /v1/chat/completions xai stream model=${model} start`);
   start();
 }
 
@@ -2227,14 +2257,17 @@ function startProxy(onStart, onPortLock) {
               return;
             }
             try {
+              log(`POST /v1/chat/completions xai model=${parsed.model} start`);
               const upstream = await doXaiCompletion(parsed);
               res.writeHead(upstream.status, { 'Content-Type': upstream.headers['content-type'] || 'application/json' });
               res.end(upstream.body);
+              log(`POST /v1/chat/completions xai model=${parsed.model} done ${upstream.status} ${Math.round(Number(process.hrtime.bigint() - start) / 1e6)}ms bytes=${upstream.body.length}`);
             } catch (e) {
               global.lastError = e.message;
               const status = e.upstreamStatus || 502;
               res.writeHead(status, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify({ error: { message: String(e.message || 'xAI upstream error').slice(0, 500), type: 'gpt_oauth_error' } }));
+              log(`POST /v1/chat/completions xai model=${parsed.model} ERROR status=${status} ${Math.round(Number(process.hrtime.bigint() - start) / 1e6)}ms: ${oneLine(e && e.message ? e.message : e)}`);
             }
             return;
           }

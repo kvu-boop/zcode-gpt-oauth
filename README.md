@@ -21,6 +21,6 @@ Optional: `/gpt-oauth:cache-miss-on` / `cache-miss-off` toggle cache-miss notice
 
 ## Version
 
-Current version: **v0.3.1** — fixes Grok model registration by writing the six Grok models into the ZCode 3.14.1 provider registry (`~/.zcode/v2/provider_config.json`) so they appear in the model picker, while keeping the legacy `~/.zcode/v2/config.json` entry in sync for older releases. Grok image/video generation is not supported. Run `/gpt-oauth:status` to check `latestVersion` and `updateAvailable`.
+Current version: **v0.3.2** — fixes Grok (xAI) streaming by removing the 5-second upstream-silence abort that killed long reasoning turns mid-stream with `Turn execution failed ... reason=unknown retryable=false`. Grok image/video generation is not supported. Run `/gpt-oauth:status` to check `latestVersion` and `updateAvailable`.
 
 Thanks for stopping by and using this plugin!
