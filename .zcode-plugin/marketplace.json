@@ -5,7 +5,7 @@
       "name": "gpt-oauth",
       "source": "./",
       "description": "ChatGPT and xAI Grok OAuth login with an OpenAI-compatible local proxy for ZCode — use GPT and Grok models in subagents without an API key",
-      "version": "0.3.2",
+      "version": "0.3.3",
       "author": { "name": "KhanhVu" }
     }
   ]

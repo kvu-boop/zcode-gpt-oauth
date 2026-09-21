@@ -38,7 +38,7 @@ const { calculateAdditionalCacheMissCost } = require('./cache/cost');
 const { buildCacheNotice } = require('./cache/notice');
 const { createXaiAuth } = require('./xai-oauth');
 
-const VERSION = '0.3.2';
+const VERSION = '0.3.3';
 const NAME = 'gpt-oauth';
 
 // ---------------------------------------------------------------------------
@@ -156,7 +156,7 @@ const xaiAuth = createXaiAuth({
   logger: { warn: (message) => log(message), info: (message) => log(message) },
 });
 const XAI_MODEL_IDS = [
-  'grok-4.6', 'grok-4.5', 'grok-4.3', 'grok-build-0.1',
+  'grok-4.7', 'grok-4.6', 'grok-4.5', 'grok-4.3', 'grok-build-0.1',
   'grok-4.20-0309-reasoning', 'grok-4.20-0309-non-reasoning',
 ];
 const ALL_MODEL_IDS = [...MODEL_IDS, ...XAI_MODEL_IDS];

@@ -35,6 +35,7 @@ const BASE_URL = 'http://127.0.0.1:8787/v1';
 
 const GPT_MODEL_IDS = ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-6-astra'];
 const GROK_MODEL_IDS = [
+  'grok-4.7',
   'grok-4.6',
   'grok-4.5',
   'grok-4.3',
@@ -89,6 +90,12 @@ const PROVIDER_MODEL_RULES = {
   'gpt-5.6-terra': providerModelRule({ contextWindow: 256000 }),
   'gpt-5.6-luna': providerModelRule({ contextWindow: 256000 }),
   'gpt-6-astra': providerModelRule({ contextWindow: 256000 }),
+  'grok-4.7': providerModelRule({
+    contextWindow: 500000,
+    inputFormat: TEXT_IMAGE_INPUT,
+    reasoningLevelValues: ['low', 'medium', 'high', 'xhigh'],
+    maxOutputTokens: 128000,
+  }),
   'grok-4.6': providerModelRule({
     contextWindow: 500000,
     inputFormat: TEXT_IMAGE_INPUT,
@@ -132,6 +139,12 @@ const LEGACY_MODEL_SPECS = {
     context: 256000,
     output: 128000,
     reasoning: { enabled: true, variants: ['low', 'medium', 'high', 'xhigh', 'max'], defaultVariant: 'high' },
+  }),
+  'grok-4.7': legacyModel({
+    context: 500000,
+    output: 500000,
+    input: ['text', 'image', 'pdf'],
+    reasoning: { enabled: true, variants: ['low', 'medium', 'high', 'xhigh'], defaultVariant: 'high' },
   }),
   'grok-4.6': legacyModel({
     context: 500000,

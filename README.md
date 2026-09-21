@@ -21,6 +21,6 @@ Optional: `/gpt-oauth:cache-miss-on` / `cache-miss-off` toggle cache-miss notice
 
 ## Version
 
-Current version: **v0.3.2** — fixes Grok (xAI) streaming by removing the 5-second upstream-silence abort that killed long reasoning turns mid-stream with `Turn execution failed ... reason=unknown retryable=false`. Grok image/video generation is not supported. Run `/gpt-oauth:status` to check `latestVersion` and `updateAvailable`.
+Current version: **v0.3.3** — adds Grok 4.7 (`grok-4.7`) to the registered Grok model set (v0.3.2 previously fixed Grok streaming by removing the 5-second upstream-silence abort). Grok image/video generation is not supported. Run `/gpt-oauth:status` to check `latestVersion` and `updateAvailable`.
 
 Thanks for stopping by and using this plugin!

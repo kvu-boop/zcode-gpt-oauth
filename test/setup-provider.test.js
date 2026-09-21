@@ -168,6 +168,17 @@ test('1. empty home: creates both registries with schema v1 and legacy shape', (
 
   const modelRules = gptOauthModelRules(providerConfig, summary.providerId);
   assert.equal(modelRules.length, ALL_MODEL_IDS.length);
+  const grok47 = modelRules.find((r) => r.modelId === 'grok-4.7');
+  assert.deepEqual(grok47.config, {
+    properties: {
+      contextWindow: 500000,
+      inputFormat: { supportsText: true, supportsImage: true, supportsVideo: false, supportsAudio: false, supportsPdf: false },
+    },
+    optionSpecs: {
+      reasoningLevel: { values: ['low', 'medium', 'high', 'xhigh'] },
+      maxOutputTokens: { max: 128000 },
+    },
+  });
   const grok46 = modelRules.find((r) => r.modelId === 'grok-4.6');
   assert.deepEqual(grok46.config, {
     properties: {
@@ -198,6 +209,11 @@ test('1. empty home: creates both registries with schema v1 and legacy shape', (
   assert.equal(entry.source, 'custom');
   assert.deepEqual(entry.options, { apiKey: 'local-proxy', baseURL: 'http://127.0.0.1:8787/v1', apiKeyRequired: true });
   assert.deepEqual(Object.keys(entry.models), ALL_MODEL_IDS);
+  assert.deepEqual(entry.models['grok-4.7'], {
+    reasoning: { enabled: true, variants: ['low', 'medium', 'high', 'xhigh'], defaultVariant: 'high' },
+    limit: { context: 500000, output: 500000 },
+    modalities: { input: ['text', 'image', 'pdf'], output: ['text'] },
+  });
   assert.deepEqual(entry.models['grok-4.6'], {
     reasoning: { enabled: true, variants: ['low', 'medium', 'high', 'xhigh'], defaultVariant: 'high' },
     limit: { context: 500000, output: 500000 },
@@ -214,7 +230,7 @@ test('1. empty home: creates both registries with schema v1 and legacy shape', (
   });
 });
 
-test('2. existing provider with GPT-only registry gains the six Grok models', () => {
+test('2. existing provider with GPT-only registry gains the seven Grok models', () => {
   const home = makeHome();
   const p = paths(home);
   const providerId = '11111111-2222-3333-4444-555555555555';
