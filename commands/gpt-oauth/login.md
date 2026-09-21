@@ -1,5 +1,5 @@
 ---
-description: Log in to ChatGPT (GPT Plus) via browser OAuth for gpt-oauth and verify the local proxy.
+description: Log in to ChatGPT (GPT Plus) via browser OAuth for gpt-oauth and verify the local proxy; use grok-login for xAI.
 ---
 
 # gpt-oauth: Login
