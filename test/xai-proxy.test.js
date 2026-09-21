@@ -82,10 +82,10 @@ test('xAI proxy routes explicitly, unions models, passes through JSON/SSE/tools,
   const models = await request(proxyPort, 'GET', '/v1/models');
   assert.equal(models.status, 200);
   const ids = JSON.parse(models.body).data.map((m) => m.id);
-  assert.ok(ids.includes('gpt-6-astra')); assert.ok(ids.includes(GROK)); assert.equal(ids.length, 10);
+  assert.ok(ids.includes('gpt-6-astra')); assert.ok(ids.includes(GROK)); assert.ok(ids.includes('grok-4.7')); assert.equal(ids.length, 11);
   const health = JSON.parse((await request(proxyPort, 'GET', '/healthz')).body);
   assert.deepEqual(health.providers, { openai: { loggedIn: true }, xai: { loggedIn: true } });
-  assert.equal(health.modelCount, 10);
+  assert.equal(health.modelCount, 11);
 
   const unknown = await request(proxyPort, 'POST', '/v1/chat/completions', { model: 'unknown', messages: [{ role: 'user', content: 'x' }] });
   assert.equal(unknown.status, 404);
