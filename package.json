@@ -1,6 +1,6 @@
 {
   "name": "gpt-oauth",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "description": "ChatGPT and xAI Grok OAuth proxy",
   "engines": { "node": ">=18" },

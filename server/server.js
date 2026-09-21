@@ -38,7 +38,7 @@ const { calculateAdditionalCacheMissCost } = require('./cache/cost');
 const { buildCacheNotice } = require('./cache/notice');
 const { createXaiAuth } = require('./xai-oauth');
 
-const VERSION = '0.3.0';
+const VERSION = '0.3.1';
 const NAME = 'gpt-oauth';
 
 // ---------------------------------------------------------------------------
