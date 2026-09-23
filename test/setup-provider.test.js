@@ -190,10 +190,16 @@ test('1. empty home: creates both registries with schema v1 and legacy shape', (
       maxOutputTokens: { max: 128000 },
     },
   });
-  const gpt6sol = modelRules.find((r) => r.modelId === 'gpt-6-sol');
-  assert.deepEqual(gpt6sol.config, { properties: { contextWindow: 256000 } });
-  const gpt6luna = modelRules.find((r) => r.modelId === 'gpt-6-luna');
-  assert.deepEqual(gpt6luna.config, { properties: { contextWindow: 256000 } });
+  const gptReasoningConfig = {
+    properties: { contextWindow: 256000 },
+    optionSpecs: {
+      reasoningLevel: { values: ['low', 'medium', 'high', 'xhigh'] },
+    },
+  };
+  for (const modelId of GPT_MODEL_IDS) {
+    const gptRule = modelRules.find((r) => r.modelId === modelId);
+    assert.deepEqual(gptRule.config, gptReasoningConfig);
+  }
 
   // No legacy shape keys leaked into provider_config.
   const serializedProviderConfig = readText(p.providerConfig);
@@ -218,18 +224,18 @@ test('1. empty home: creates both registries with schema v1 and legacy shape', (
     modalities: { input: ['text', 'image', 'pdf'], output: ['text'] },
   });
   assert.deepEqual(entry.models['gpt-6-sol'], {
-    reasoning: { enabled: true, variants: ['none', 'low', 'medium', 'high', 'xhigh', 'max'], defaultVariant: 'medium' },
+    reasoning: { enabled: true, variants: ['low', 'medium', 'high', 'xhigh'], defaultVariant: 'medium' },
     limit: { context: 256000, output: 128000 },
     modalities: { input: ['text', 'image'], output: ['text'] },
   });
   assert.deepEqual(entry.models['gpt-6-luna'], {
-    reasoning: { enabled: true, variants: ['none', 'low', 'medium', 'high', 'xhigh', 'max'], defaultVariant: 'medium' },
+    reasoning: { enabled: true, variants: ['low', 'medium', 'high', 'xhigh'], defaultVariant: 'medium' },
     limit: { context: 256000, output: 128000 },
     modalities: { input: ['text', 'image'], output: ['text'] },
   });
   assert.deepEqual(entry.models['gpt-6-astra'].reasoning, {
     enabled: true,
-    variants: ['low', 'medium', 'high', 'xhigh', 'max'],
+    variants: ['low', 'medium', 'high', 'xhigh'],
     defaultVariant: 'high',
   });
 });
@@ -353,6 +359,125 @@ test('5. existing model rules with local customizations are not overwritten', ()
     properties: { contextWindow: 123, custom: true },
     optionSpecs: { reasoningLevel: { values: ['only-mine'] } },
   });
+});
+
+test('5b. GPT reasoningLevel values refresh while unrelated model config is preserved', () => {
+  const home = makeHome();
+  const p = paths(home);
+  const providerId = '11111111-2222-3333-4444-555555555555';
+  const providerConfig = fixtureProviderConfigGptOnly(providerId);
+  const gptRules = providerConfig.config.modelConfigRules.providerModelRules.filter(
+    (r) => r.providerId === providerId,
+  );
+  for (const rule of gptRules) {
+    rule.config = {
+      properties: { contextWindow: 256000, localNote: `keep-${rule.modelId}` },
+      optionSpecs: {
+        reasoningLevel: { values: ['none', 'max'], extra: true },
+        maxOutputTokens: { max: 999 },
+      },
+      unknownModelField: { keep: rule.modelId },
+    };
+  }
+  writeJson(p.providerConfig, providerConfig);
+  writeJson(p.legacyConfig, fixtureLegacyConfigGptOnly(providerId));
+
+  const first = runSetup({ home });
+  assert.equal(first.addedProviderModelRuleIds.includes('gpt-6-astra'), false);
+  assert.equal(first.addedProviderModelRuleIds.includes('gpt-6-sol'), false);
+  assert.equal(first.addedProviderModelRuleIds.includes('gpt-6-luna'), false);
+
+  const afterFirst = readJson(p.providerConfig);
+  for (const modelId of GPT_MODEL_IDS) {
+    const rule = gptOauthModelRules(afterFirst, providerId).find((r) => r.modelId === modelId);
+    assert.deepEqual(rule.config.optionSpecs.reasoningLevel.values, ['low', 'medium', 'high', 'xhigh']);
+    assert.equal(rule.config.optionSpecs.reasoningLevel.extra, true);
+    assert.deepEqual(rule.config.optionSpecs.maxOutputTokens, { max: 999 });
+    assert.equal(rule.config.properties.contextWindow, 256000);
+    assert.equal(rule.config.properties.localNote, `keep-${modelId}`);
+    assert.deepEqual(rule.config.unknownModelField, { keep: modelId });
+  }
+  const deepseekRule = afterFirst.config.modelConfigRules.providerModelRules.find(
+    (r) => r.providerId === OTHER_PROVIDER_ID && r.modelId === 'deepseek-flash',
+  );
+  assert.deepEqual(deepseekRule.config, { properties: { contextWindow: 1000000 } });
+
+  const snapshot = {
+    providerConfig: readText(p.providerConfig),
+    legacyConfig: readText(p.legacyConfig),
+    providerUuid: readText(p.providerUuid),
+  };
+  const second = runSetup({ home });
+  assert.deepEqual(second.addedModelIds, []);
+  assert.deepEqual(second.addedProviderModelRuleIds, []);
+  assert.deepEqual(second.updatedFiles, []);
+  assert.deepEqual(second.backups, []);
+  assert.equal(readText(p.providerConfig), snapshot.providerConfig);
+  assert.equal(readText(p.legacyConfig), snapshot.legacyConfig);
+  assert.equal(readText(p.providerUuid), snapshot.providerUuid);
+});
+
+test('5c. existing legacy GPT variants refresh while defaultVariant and custom fields survive', () => {
+  const home = makeHome();
+  const p = paths(home);
+  const providerId = '11111111-2222-3333-4444-555555555555';
+  const legacy = fixtureLegacyConfigGptOnly(providerId);
+  const staleByModel = {
+    'gpt-6-astra': ['low', 'medium', 'high', 'xhigh', 'max'],
+    'gpt-6-sol': ['none', 'low', 'medium', 'high', 'xhigh', 'max'],
+    'gpt-6-luna': ['none', 'low', 'medium', 'high', 'xhigh', 'max'],
+  };
+  const defaultsByModel = {
+    'gpt-6-astra': 'high',
+    'gpt-6-sol': 'medium',
+    'gpt-6-luna': 'medium',
+  };
+  for (const modelId of GPT_MODEL_IDS) {
+    legacy.provider[providerId].models[modelId] = {
+      reasoning: {
+        enabled: true,
+        variants: staleByModel[modelId],
+        defaultVariant: defaultsByModel[modelId],
+        extraFlag: true,
+      },
+      limit: { context: 256000, output: 128000, custom: modelId },
+      modalities: { input: ['text', 'image'], output: ['text'] },
+      localNote: `keep-${modelId}`,
+    };
+  }
+  writeJson(p.providerConfig, fixtureProviderConfigGptOnly(providerId));
+  writeJson(p.legacyConfig, legacy);
+
+  const first = runSetup({ home });
+  assert.equal(first.addedLegacyModelIds.includes('gpt-6-astra'), false);
+  assert.equal(first.addedLegacyModelIds.includes('gpt-6-sol'), false);
+  assert.equal(first.addedLegacyModelIds.includes('gpt-6-luna'), false);
+
+  const afterFirst = legacyEntry(readJson(p.legacyConfig), providerId).models;
+  for (const modelId of GPT_MODEL_IDS) {
+    const spec = afterFirst[modelId];
+    assert.deepEqual(spec.reasoning.variants, ['low', 'medium', 'high', 'xhigh']);
+    assert.equal(spec.reasoning.defaultVariant, defaultsByModel[modelId]);
+    assert.equal(spec.reasoning.enabled, true);
+    assert.equal(spec.reasoning.extraFlag, true);
+    assert.deepEqual(spec.limit, { context: 256000, output: 128000, custom: modelId });
+    assert.deepEqual(spec.modalities, { input: ['text', 'image'], output: ['text'] });
+    assert.equal(spec.localNote, `keep-${modelId}`);
+  }
+  assert.deepEqual(readJson(p.legacyConfig).provider[OTHER_PROVIDER_ID], legacy.provider[OTHER_PROVIDER_ID]);
+
+  const snapshot = {
+    providerConfig: readText(p.providerConfig),
+    legacyConfig: readText(p.legacyConfig),
+    providerUuid: readText(p.providerUuid),
+  };
+  const second = runSetup({ home });
+  assert.deepEqual(second.addedLegacyModelIds, []);
+  assert.deepEqual(second.updatedFiles, []);
+  assert.deepEqual(second.backups, []);
+  assert.equal(readText(p.providerConfig), snapshot.providerConfig);
+  assert.equal(readText(p.legacyConfig), snapshot.legacyConfig);
+  assert.equal(readText(p.providerUuid), snapshot.providerUuid);
 });
 
 test('6. broken JSON and unsupported schemaVersion fail without writing', () => {

@@ -90,9 +90,18 @@ function providerModelRule(options) {
 
 // Canonical `modelConfigRules.providerModelRules[].config` per model.
 const PROVIDER_MODEL_RULES = {
-  'gpt-6-astra': providerModelRule({ contextWindow: 256000 }),
-  'gpt-6-sol': providerModelRule({ contextWindow: 256000 }),
-  'gpt-6-luna': providerModelRule({ contextWindow: 256000 }),
+  'gpt-6-astra': providerModelRule({
+    contextWindow: 256000,
+    reasoningLevelValues: ['low', 'medium', 'high', 'xhigh'],
+  }),
+  'gpt-6-sol': providerModelRule({
+    contextWindow: 256000,
+    reasoningLevelValues: ['low', 'medium', 'high', 'xhigh'],
+  }),
+  'gpt-6-luna': providerModelRule({
+    contextWindow: 256000,
+    reasoningLevelValues: ['low', 'medium', 'high', 'xhigh'],
+  }),
   'grok-4.7': providerModelRule({
     contextWindow: 500000,
     inputFormat: TEXT_IMAGE_INPUT,
@@ -120,17 +129,17 @@ const LEGACY_MODEL_SPECS = {
   'gpt-6-astra': legacyModel({
     context: 256000,
     output: 128000,
-    reasoning: { enabled: true, variants: ['low', 'medium', 'high', 'xhigh', 'max'], defaultVariant: 'high' },
+    reasoning: { enabled: true, variants: ['low', 'medium', 'high', 'xhigh'], defaultVariant: 'high' },
   }),
   'gpt-6-sol': legacyModel({
     context: 256000,
     output: 128000,
-    reasoning: { enabled: true, variants: ['none', 'low', 'medium', 'high', 'xhigh', 'max'], defaultVariant: 'medium' },
+    reasoning: { enabled: true, variants: ['low', 'medium', 'high', 'xhigh'], defaultVariant: 'medium' },
   }),
   'gpt-6-luna': legacyModel({
     context: 256000,
     output: 128000,
-    reasoning: { enabled: true, variants: ['none', 'low', 'medium', 'high', 'xhigh', 'max'], defaultVariant: 'medium' },
+    reasoning: { enabled: true, variants: ['low', 'medium', 'high', 'xhigh'], defaultVariant: 'medium' },
   }),
   'grok-4.7': legacyModel({
     context: 500000,
@@ -371,6 +380,17 @@ function mergeProviderConfig(draft, fallbackProviderId, options = {}) {
   providerModelRules.length = 0;
   providerModelRules.push(...others, ...ALL_MODEL_IDS.map((modelId) => ours.get(modelId)).filter(Boolean));
 
+  for (const modelId of GPT_MODEL_IDS) {
+    const entry = ours.get(modelId);
+    if (!isPlainObject(entry)) continue;
+    const managedValues = PROVIDER_MODEL_RULES[modelId]?.optionSpecs?.reasoningLevel?.values;
+    if (!managedValues) continue;
+    const config = ensureObject(entry, 'config', filePath);
+    const optionSpecs = ensureObject(config, 'optionSpecs', filePath);
+    const reasoningLevel = ensureObject(optionSpecs, 'reasoningLevel', filePath);
+    reasoningLevel.values = cloneJson(managedValues);
+  }
+
   const addedToOrder = !providerOrder.includes(providerId);
   if (addedToOrder) providerOrder.push(providerId);
 
@@ -435,6 +455,14 @@ function mergeLegacyConfig(draft, providerId, options = {}) {
       models[modelId] = cloneJson(LEGACY_MODEL_SPECS[modelId]);
       addedModelIds.push(modelId);
     }
+  }
+  for (const modelId of GPT_MODEL_IDS) {
+    const spec = models[modelId];
+    if (!isPlainObject(spec)) continue;
+    const managedVariants = LEGACY_MODEL_SPECS[modelId]?.reasoning?.variants;
+    if (!managedVariants) continue;
+    const reasoning = ensureObject(spec, 'reasoning', filePath);
+    reasoning.variants = cloneJson(managedVariants);
   }
   const orderedModels = {};
   for (const modelId of ALL_MODEL_IDS) {
