@@ -33,17 +33,21 @@ const API_KEY_LITERAL = 'local-proxy';
 const API_TYPE = 'openai-chat-completions';
 const BASE_URL = 'http://127.0.0.1:8787/v1';
 
-const GPT_MODEL_IDS = ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-6-astra'];
-const GROK_MODEL_IDS = [
-  'grok-4.7',
-  'grok-4.6',
+const GPT_MODEL_IDS = ['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna'];
+const GROK_MODEL_IDS = ['grok-4.7', 'grok-4.6'];
+const ALL_MODEL_IDS = [...GPT_MODEL_IDS, ...GROK_MODEL_IDS];
+// Ids this helper used to register. Setup removes only these from the gpt-oauth
+// provider. A model the user added by hand is left alone.
+const RETIRED_MODEL_IDS = [
+  'gpt-5.6-sol',
+  'gpt-5.6-terra',
+  'gpt-5.6-luna',
   'grok-4.5',
   'grok-4.3',
   'grok-build-0.1',
   'grok-4.20-0309-reasoning',
   'grok-4.20-0309-non-reasoning',
 ];
-const ALL_MODEL_IDS = [...GPT_MODEL_IDS, ...GROK_MODEL_IDS];
 
 class SetupError extends Error {
   constructor(message) {
@@ -86,10 +90,9 @@ function providerModelRule(options) {
 
 // Canonical `modelConfigRules.providerModelRules[].config` per model.
 const PROVIDER_MODEL_RULES = {
-  'gpt-5.6-sol': providerModelRule({ contextWindow: 256000 }),
-  'gpt-5.6-terra': providerModelRule({ contextWindow: 256000 }),
-  'gpt-5.6-luna': providerModelRule({ contextWindow: 256000 }),
   'gpt-6-astra': providerModelRule({ contextWindow: 256000 }),
+  'gpt-6-sol': providerModelRule({ contextWindow: 256000 }),
+  'gpt-6-luna': providerModelRule({ contextWindow: 256000 }),
   'grok-4.7': providerModelRule({
     contextWindow: 500000,
     inputFormat: TEXT_IMAGE_INPUT,
@@ -101,24 +104,6 @@ const PROVIDER_MODEL_RULES = {
     inputFormat: TEXT_IMAGE_INPUT,
     reasoningLevelValues: ['low', 'medium', 'high', 'xhigh'],
     maxOutputTokens: 128000,
-  }),
-  'grok-4.5': providerModelRule({
-    contextWindow: 500000,
-    inputFormat: TEXT_IMAGE_INPUT,
-    reasoningLevelValues: ['low', 'medium', 'high'],
-    maxOutputTokens: 128000,
-  }),
-  'grok-4.3': providerModelRule({ contextWindow: 1000000, inputFormat: TEXT_IMAGE_INPUT, maxOutputTokens: 128000 }),
-  'grok-build-0.1': providerModelRule({ contextWindow: 256000, inputFormat: TEXT_IMAGE_INPUT, maxOutputTokens: 128000 }),
-  'grok-4.20-0309-reasoning': providerModelRule({
-    contextWindow: 1000000,
-    inputFormat: TEXT_IMAGE_INPUT,
-    maxOutputTokens: 30000,
-  }),
-  'grok-4.20-0309-non-reasoning': providerModelRule({
-    contextWindow: 1000000,
-    inputFormat: TEXT_IMAGE_INPUT,
-    maxOutputTokens: 30000,
   }),
 };
 
@@ -132,13 +117,20 @@ function legacyModel(options) {
 
 // Canonical legacy `provider.<id>.models` entries.
 const LEGACY_MODEL_SPECS = {
-  'gpt-5.6-sol': legacyModel({ context: 256000, output: 128000 }),
-  'gpt-5.6-terra': legacyModel({ context: 256000, output: 128000 }),
-  'gpt-5.6-luna': legacyModel({ context: 256000, output: 128000 }),
   'gpt-6-astra': legacyModel({
     context: 256000,
     output: 128000,
     reasoning: { enabled: true, variants: ['low', 'medium', 'high', 'xhigh', 'max'], defaultVariant: 'high' },
+  }),
+  'gpt-6-sol': legacyModel({
+    context: 256000,
+    output: 128000,
+    reasoning: { enabled: true, variants: ['none', 'low', 'medium', 'high', 'xhigh', 'max'], defaultVariant: 'medium' },
+  }),
+  'gpt-6-luna': legacyModel({
+    context: 256000,
+    output: 128000,
+    reasoning: { enabled: true, variants: ['none', 'low', 'medium', 'high', 'xhigh', 'max'], defaultVariant: 'medium' },
   }),
   'grok-4.7': legacyModel({
     context: 500000,
@@ -151,30 +143,6 @@ const LEGACY_MODEL_SPECS = {
     output: 500000,
     input: ['text', 'image', 'pdf'],
     reasoning: { enabled: true, variants: ['low', 'medium', 'high', 'xhigh'], defaultVariant: 'high' },
-  }),
-  'grok-4.5': legacyModel({
-    context: 500000,
-    output: 500000,
-    input: ['text', 'image', 'pdf'],
-    reasoning: { enabled: true, variants: ['low', 'medium', 'high'] },
-  }),
-  'grok-4.3': legacyModel({
-    context: 1000000,
-    output: 30000,
-    input: ['text', 'image', 'pdf'],
-    reasoning: { enabled: true, variants: ['none', 'low', 'medium', 'high'] },
-  }),
-  'grok-build-0.1': legacyModel({ context: 256000, output: 256000, input: ['text', 'image', 'pdf'] }),
-  'grok-4.20-0309-reasoning': legacyModel({
-    context: 1000000,
-    output: 30000,
-    input: ['text', 'image', 'pdf'],
-    reasoning: { enabled: true },
-  }),
-  'grok-4.20-0309-non-reasoning': legacyModel({
-    context: 1000000,
-    output: 30000,
-    input: ['text', 'image', 'pdf'],
   }),
 };
 
@@ -342,14 +310,43 @@ function mergeProviderConfig(draft, fallbackProviderId, options = {}) {
   fillMissing(api, 'baseUrl', BASE_URL);
 
   const addedModelIds = [];
+  const removedModelIds = [];
   for (const key of ['personalModelIds', 'modelOrder']) {
     const list = ensureArray(ruleConfig, key, filePath);
+    const kept = [];
+    for (const id of list) {
+      if (!RETIRED_MODEL_IDS.includes(id)) {
+        kept.push(id);
+      } else if (!removedModelIds.includes(id)) {
+        removedModelIds.push(id);
+      }
+    }
+    list.length = 0;
+    list.push(...kept);
     for (const id of appendMissingIds(list, ALL_MODEL_IDS)) {
       if (!addedModelIds.includes(id)) addedModelIds.push(id);
+    }
+    const libraryIds = list.filter((id) => ALL_MODEL_IDS.includes(id));
+    if (libraryIds.length === list.length) {
+      list.length = 0;
+      list.push(...ALL_MODEL_IDS);
     }
   }
 
   const addedModelRuleIds = [];
+  const removedProviderModelRuleIds = [];
+  const keptProviderModelRules = [];
+  for (const entry of providerModelRules) {
+    if (isPlainObject(entry) && entry.providerId === providerId && RETIRED_MODEL_IDS.includes(entry.modelId)) {
+      if (typeof entry.modelId === 'string' && !removedProviderModelRuleIds.includes(entry.modelId)) {
+        removedProviderModelRuleIds.push(entry.modelId);
+      }
+      continue;
+    }
+    keptProviderModelRules.push(entry);
+  }
+  providerModelRules.length = 0;
+  providerModelRules.push(...keptProviderModelRules);
   for (const modelId of ALL_MODEL_IDS) {
     const exists = providerModelRules.some(
       (entry) => isPlainObject(entry) && entry.providerId === providerId && entry.modelId === modelId,
@@ -362,11 +359,31 @@ function mergeProviderConfig(draft, fallbackProviderId, options = {}) {
     });
     addedModelRuleIds.push(modelId);
   }
+  const ours = new Map();
+  const others = [];
+  for (const entry of providerModelRules) {
+    if (isPlainObject(entry) && entry.providerId === providerId && ALL_MODEL_IDS.includes(entry.modelId)) {
+      if (!ours.has(entry.modelId)) ours.set(entry.modelId, entry);
+    } else {
+      others.push(entry);
+    }
+  }
+  providerModelRules.length = 0;
+  providerModelRules.push(...others, ...ALL_MODEL_IDS.map((modelId) => ours.get(modelId)).filter(Boolean));
 
   const addedToOrder = !providerOrder.includes(providerId);
   if (addedToOrder) providerOrder.push(providerId);
 
-  return { draft, providerId, ruleCreated: created, addedModelIds, addedModelRuleIds, addedToOrder };
+  return {
+    draft,
+    providerId,
+    ruleCreated: created,
+    addedModelIds,
+    addedModelRuleIds,
+    addedToOrder,
+    removedModelIds,
+    removedProviderModelRuleIds,
+  };
 }
 
 /**
@@ -406,14 +423,32 @@ function mergeLegacyConfig(draft, providerId, options = {}) {
 
   const models = ensureObject(entry, 'models', filePath);
   const addedModelIds = [];
+  const removedModelIds = [];
+  for (const modelId of Object.keys(models)) {
+    if (RETIRED_MODEL_IDS.includes(modelId)) {
+      removedModelIds.push(modelId);
+      delete models[modelId];
+    }
+  }
   for (const modelId of ALL_MODEL_IDS) {
     if (models[modelId] === undefined || models[modelId] === null) {
       models[modelId] = cloneJson(LEGACY_MODEL_SPECS[modelId]);
       addedModelIds.push(modelId);
     }
   }
+  const orderedModels = {};
+  for (const modelId of ALL_MODEL_IDS) {
+    orderedModels[modelId] = models[modelId];
+  }
+  for (const modelId of Object.keys(models)) {
+    if (!ALL_MODEL_IDS.includes(modelId)) orderedModels[modelId] = models[modelId];
+    delete models[modelId];
+  }
+  for (const modelId of Object.keys(orderedModels)) {
+    models[modelId] = orderedModels[modelId];
+  }
 
-  return { draft, providerKey, entryCreated: created, addedModelIds };
+  return { draft, providerKey, entryCreated: created, addedModelIds, removedModelIds };
 }
 
 function writeFileAtomic(filePath, content) {
@@ -552,6 +587,9 @@ function runSetup(options = {}) {
     addedModelIds: providerMerge.addedModelIds,
     addedProviderModelRuleIds: providerMerge.addedModelRuleIds,
     addedLegacyModelIds: legacyMerge.addedModelIds,
+    removedModelIds: providerMerge.removedModelIds,
+    removedProviderModelRuleIds: providerMerge.removedProviderModelRuleIds,
+    removedLegacyModelIds: legacyMerge.removedModelIds,
     providerRuleCreated: providerMerge.ruleCreated,
     legacyEntryCreated: legacyMerge.entryCreated,
     createdFiles,
@@ -572,6 +610,9 @@ function formatSummary(summary) {
     `added model ids (${summary.addedModelIds.length}): ${list(summary.addedModelIds)}`,
     `added model rules (${summary.addedProviderModelRuleIds.length}): ${list(summary.addedProviderModelRuleIds)}`,
     `added legacy model ids (${summary.addedLegacyModelIds.length}): ${list(summary.addedLegacyModelIds)}`,
+    `removed model ids (${summary.removedModelIds.length}): ${list(summary.removedModelIds)}`,
+    `removed model rules (${summary.removedProviderModelRuleIds.length}): ${list(summary.removedProviderModelRuleIds)}`,
+    `removed legacy model ids (${summary.removedLegacyModelIds.length}): ${list(summary.removedLegacyModelIds)}`,
     `created files: ${list(summary.createdFiles)}`,
     `updated files: ${list(summary.updatedFiles)}`,
     `backups: ${list(summary.backups)}`,
@@ -636,6 +677,7 @@ module.exports = {
   GPT_MODEL_IDS,
   GROK_MODEL_IDS,
   ALL_MODEL_IDS,
+  RETIRED_MODEL_IDS,
   PROVIDER_MODEL_RULES,
   LEGACY_MODEL_SPECS,
   SetupError,

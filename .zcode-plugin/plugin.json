@@ -1,7 +1,7 @@
 {
   "name": "gpt-oauth",
   "description": "ChatGPT and xAI Grok OAuth login with an OpenAI-compatible local proxy. Login via browser/device flow, then register provider baseURL http://127.0.0.1:8787/v1 to use GPT and Grok models without an API key.",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "author": { "name": "kvu" },
   "commands": ["commands"],
   "mcpServers": {

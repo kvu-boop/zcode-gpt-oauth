@@ -21,6 +21,6 @@ Optional: `/gpt-oauth:cache-miss-on` / `cache-miss-off` toggle cache-miss notice
 
 ## Version
 
-Current version: **v0.3.3** — adds Grok 4.7 (`grok-4.7`) to the registered Grok model set (v0.3.2 previously fixed Grok streaming by removing the 5-second upstream-silence abort). Grok image/video generation is not supported. Run `/gpt-oauth:status` to check `latestVersion` and `updateAvailable`.
+Current version: **v0.3.4** — the library is now GPT-6 (`gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`) and Grok 4.6/4.7 only; older ids are removed from the proxy and pruned from the provider registry on setup (v0.3.2 previously fixed Grok streaming). Grok image/video generation is not supported. Run `/gpt-oauth:status` to check `latestVersion` and `updateAvailable`.
 
 Thanks for stopping by and using this plugin!

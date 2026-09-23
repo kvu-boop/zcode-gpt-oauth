@@ -190,12 +190,10 @@ test('1. empty home: creates both registries with schema v1 and legacy shape', (
       maxOutputTokens: { max: 128000 },
     },
   });
-  const grok43 = modelRules.find((r) => r.modelId === 'grok-4.3');
-  assert.equal(grok43.config.properties.contextWindow, 1000000);
-  assert.equal(grok43.config.optionSpecs.reasoningLevel, undefined);
-  assert.deepEqual(grok43.config.optionSpecs.maxOutputTokens, { max: 128000 });
-  const grokReasoning = modelRules.find((r) => r.modelId === 'grok-4.20-0309-reasoning');
-  assert.deepEqual(grokReasoning.config.optionSpecs, { maxOutputTokens: { max: 30000 } });
+  const gpt6sol = modelRules.find((r) => r.modelId === 'gpt-6-sol');
+  assert.deepEqual(gpt6sol.config, { properties: { contextWindow: 256000 } });
+  const gpt6luna = modelRules.find((r) => r.modelId === 'gpt-6-luna');
+  assert.deepEqual(gpt6luna.config, { properties: { contextWindow: 256000 } });
 
   // No legacy shape keys leaked into provider_config.
   const serializedProviderConfig = readText(p.providerConfig);
@@ -219,18 +217,24 @@ test('1. empty home: creates both registries with schema v1 and legacy shape', (
     limit: { context: 500000, output: 500000 },
     modalities: { input: ['text', 'image', 'pdf'], output: ['text'] },
   });
-  assert.deepEqual(entry.models['grok-4.3'], {
-    reasoning: { enabled: true, variants: ['none', 'low', 'medium', 'high'] },
-    limit: { context: 1000000, output: 30000 },
-    modalities: { input: ['text', 'image', 'pdf'], output: ['text'] },
-  });
-  assert.deepEqual(entry.models['gpt-5.6-sol'], {
+  assert.deepEqual(entry.models['gpt-6-sol'], {
+    reasoning: { enabled: true, variants: ['none', 'low', 'medium', 'high', 'xhigh', 'max'], defaultVariant: 'medium' },
     limit: { context: 256000, output: 128000 },
     modalities: { input: ['text', 'image'], output: ['text'] },
   });
+  assert.deepEqual(entry.models['gpt-6-luna'], {
+    reasoning: { enabled: true, variants: ['none', 'low', 'medium', 'high', 'xhigh', 'max'], defaultVariant: 'medium' },
+    limit: { context: 256000, output: 128000 },
+    modalities: { input: ['text', 'image'], output: ['text'] },
+  });
+  assert.deepEqual(entry.models['gpt-6-astra'].reasoning, {
+    enabled: true,
+    variants: ['low', 'medium', 'high', 'xhigh', 'max'],
+    defaultVariant: 'high',
+  });
 });
 
-test('2. existing provider with GPT-only registry gains the seven Grok models', () => {
+test('2. existing provider with GPT-6 registry gains the two Grok models', () => {
   const home = makeHome();
   const p = paths(home);
   const providerId = '11111111-2222-3333-4444-555555555555';
@@ -246,10 +250,10 @@ test('2. existing provider with GPT-only registry gains the seven Grok models', 
 
   const providerConfig = readJson(p.providerConfig);
   const rule = gptOauthRule(providerConfig);
-  // Existing 4 GPT ids keep their position at the front of both lists.
+  // Existing GPT-6 ids keep their position at the front of both lists.
   assert.deepEqual(rule.config.personalModelIds, ALL_MODEL_IDS);
   assert.deepEqual(rule.config.modelOrder, ALL_MODEL_IDS);
-  assert.deepEqual(rule.config.personalModelIds.slice(0, 4), GPT_MODEL_IDS);
+  assert.deepEqual(rule.config.personalModelIds.slice(0, GPT_MODEL_IDS.length), GPT_MODEL_IDS);
   assert.deepEqual(providerConfig.config.providerOrder, [OTHER_PROVIDER_ID, providerId]);
   assert.equal(gptOauthModelRules(providerConfig, providerId).length, ALL_MODEL_IDS.length);
 
@@ -277,6 +281,9 @@ test('3. running twice is idempotent and leaves file content untouched', () => {
   assert.deepEqual(second.addedModelIds, []);
   assert.deepEqual(second.addedProviderModelRuleIds, []);
   assert.deepEqual(second.addedLegacyModelIds, []);
+  assert.deepEqual(second.removedModelIds, []);
+  assert.deepEqual(second.removedProviderModelRuleIds, []);
+  assert.deepEqual(second.removedLegacyModelIds, []);
   assert.deepEqual(second.createdFiles, []);
   assert.deepEqual(second.updatedFiles, []);
   assert.deepEqual(second.backups, []);
@@ -449,7 +456,7 @@ test('8. summary and CLI output never contain other providers secrets', () => {
   assert.equal(output.includes(providerId), true);
   assert.equal(output.includes(cliPaths.providerConfig), true);
   assert.equal(output.includes(cliPaths.legacyConfig), true);
-  assert.equal(output.includes('grok-4.20-0309-non-reasoning'), true);
+  assert.equal(output.includes('grok-4.7'), true);
 });
 
 test('9. CLI reports a clear failure (exit code 1) for unsupported schemaVersion', () => {
@@ -483,4 +490,193 @@ test('10. explicit provider id file is reused and unknown CLI args fail', () => 
   assert.equal(main(['--nope'], { stdout: { write() {} }, stderr: { write() {} } }), 1);
   assert.equal(main(['--home'], { stdout: { write() {} }, stderr: { write() {} } }), 1);
   assert.equal(main(['--help'], { stdout: { write() {} }, stderr: { write() {} } }), 0);
+});
+
+const OLD_REGISTRY_IDS = [
+  'gpt-5.6-sol',
+  'gpt-5.6-terra',
+  'gpt-5.6-luna',
+  'gpt-6-astra',
+  'grok-4.7',
+  'grok-4.6',
+  'grok-4.5',
+  'grok-4.3',
+  'grok-build-0.1',
+  'grok-4.20-0309-reasoning',
+  'grok-4.20-0309-non-reasoning',
+];
+const RETIRED_MODEL_IDS = [
+  'gpt-5.6-sol',
+  'gpt-5.6-terra',
+  'gpt-5.6-luna',
+  'grok-4.5',
+  'grok-4.3',
+  'grok-build-0.1',
+  'grok-4.20-0309-reasoning',
+  'grok-4.20-0309-non-reasoning',
+];
+
+function fixtureOldElevenIdProviderConfig(providerId) {
+  return {
+    schemaVersion: 1,
+    config: {
+      providerOrder: [OTHER_PROVIDER_ID, providerId],
+      providerConfigRules: {
+        providerRules: [
+          {
+            providerId: OTHER_PROVIDER_ID,
+            providerName: 'deepseek',
+            config: {
+              group: 'standard-personal',
+              access: { type: 'api-key', apiKey: FAKE_SECRET },
+              api: { type: 'anthropic', baseUrl: 'https://api.deepseek.com/anthropic' },
+              personalModelIds: ['gpt-5.6-sol', 'deepseek-flash'],
+              modelOrder: ['gpt-5.6-sol', 'deepseek-flash'],
+            },
+          },
+          {
+            providerId,
+            providerName: PROVIDER_NAME,
+            config: {
+              group: 'standard-personal',
+              access: { type: 'api-key', apiKey: 'local-proxy' },
+              api: { type: 'openai-chat-completions', baseUrl: 'http://127.0.0.1:8787/v1' },
+              personalModelIds: [...OLD_REGISTRY_IDS],
+              modelOrder: [...OLD_REGISTRY_IDS],
+            },
+          },
+        ],
+      },
+      modelConfigRules: {
+        providerModelRules: [
+          { providerId: OTHER_PROVIDER_ID, modelId: 'gpt-5.6-sol', config: { properties: { contextWindow: 256000 } } },
+          { providerId: OTHER_PROVIDER_ID, modelId: 'deepseek-flash', config: { properties: { contextWindow: 1000000 } } },
+          ...OLD_REGISTRY_IDS.map((modelId) => ({
+            providerId,
+            modelId,
+            config: { properties: { contextWindow: 256000 } },
+          })),
+        ],
+        manualProviderModelRules: [],
+      },
+    },
+  };
+}
+
+function fixtureOldElevenIdLegacyConfig(providerId) {
+  return {
+    provider: {
+      [OTHER_PROVIDER_ID]: {
+        name: 'deepseek',
+        kind: 'anthropic',
+        options: { apiKey: FAKE_SECRET, baseURL: 'https://api.deepseek.com/anthropic', apiKeyRequired: true },
+        source: 'custom',
+        models: {
+          'gpt-5.6-sol': { limit: { context: 256000, output: 128000 } },
+          'deepseek-flash': { limit: { context: 1000000, output: 384000 } },
+        },
+      },
+      [providerId]: {
+        name: PROVIDER_NAME,
+        kind: 'openai-compatible',
+        options: { apiKey: 'local-proxy', baseURL: 'http://127.0.0.1:8787/v1', apiKeyRequired: true },
+        source: 'custom',
+        models: Object.fromEntries(
+          OLD_REGISTRY_IDS.map((id) => [id, { limit: { context: 256000, output: 128000 } }]),
+        ),
+      },
+    },
+  };
+}
+
+test('11. old 11-id registry is pruned to ALL_MODEL_IDS without touching another provider', () => {
+  const home = makeHome();
+  const p = paths(home);
+  const providerId = '11111111-2222-3333-4444-555555555555';
+  writeJson(p.providerConfig, fixtureOldElevenIdProviderConfig(providerId));
+  writeJson(p.legacyConfig, fixtureOldElevenIdLegacyConfig(providerId));
+
+  const summary = runSetup({ home });
+  assert.deepEqual(summary.removedModelIds, RETIRED_MODEL_IDS);
+  assert.deepEqual(summary.removedProviderModelRuleIds, RETIRED_MODEL_IDS);
+  assert.deepEqual(summary.removedLegacyModelIds, RETIRED_MODEL_IDS);
+  const formatted = formatSummary(summary);
+  assert.equal(formatted.includes(`removed model ids (${RETIRED_MODEL_IDS.length}): ${RETIRED_MODEL_IDS.join(', ')}`), true);
+  assert.equal(formatted.includes(`removed model rules (${RETIRED_MODEL_IDS.length}): ${RETIRED_MODEL_IDS.join(', ')}`), true);
+  assert.equal(formatted.includes(`removed legacy model ids (${RETIRED_MODEL_IDS.length}): ${RETIRED_MODEL_IDS.join(', ')}`), true);
+
+  const providerConfig = readJson(p.providerConfig);
+  const rule = gptOauthRule(providerConfig);
+  assert.deepEqual(rule.config.personalModelIds, ALL_MODEL_IDS);
+  assert.deepEqual(rule.config.modelOrder, ALL_MODEL_IDS);
+  assert.deepEqual(
+    gptOauthModelRules(providerConfig, providerId).map((r) => r.modelId),
+    ALL_MODEL_IDS,
+  );
+  const deepseek = providerConfig.config.providerConfigRules.providerRules.find((r) => r.providerName === 'deepseek');
+  assert.equal(deepseek.config.personalModelIds.includes('gpt-5.6-sol'), true);
+  assert.equal(
+    providerConfig.config.modelConfigRules.providerModelRules.some(
+      (r) => r.providerId === OTHER_PROVIDER_ID && r.modelId === 'gpt-5.6-sol',
+    ),
+    true,
+  );
+
+  const legacy = readJson(p.legacyConfig);
+  assert.deepEqual(Object.keys(legacyEntry(legacy, providerId).models), ALL_MODEL_IDS);
+  assert.equal('gpt-5.6-sol' in legacy.provider[OTHER_PROVIDER_ID].models, true);
+
+  const snapshot = {
+    providerConfig: readText(p.providerConfig),
+    legacyConfig: readText(p.legacyConfig),
+    providerUuid: readText(p.providerUuid),
+  };
+  const second = runSetup({ home });
+  assert.deepEqual(second.addedModelIds, []);
+  assert.deepEqual(second.removedModelIds, []);
+  assert.deepEqual(second.removedProviderModelRuleIds, []);
+  assert.deepEqual(second.removedLegacyModelIds, []);
+  assert.equal(formatSummary(second).includes('removed model ids (0): (none)'), true);
+  assert.equal(formatSummary(second).includes('removed model rules (0): (none)'), true);
+  assert.equal(formatSummary(second).includes('removed legacy model ids (0): (none)'), true);
+  assert.deepEqual(second.updatedFiles, []);
+  assert.equal(readText(p.providerConfig), snapshot.providerConfig);
+  assert.equal(readText(p.legacyConfig), snapshot.legacyConfig);
+  assert.equal(readText(p.providerUuid), snapshot.providerUuid);
+});
+
+test('12. a hand-added gpt-oauth model survives setup while retired ids are removed', () => {
+  const home = makeHome();
+  const p = paths(home);
+  const providerId = '11111111-2222-3333-4444-555555555555';
+  const providerConfig = fixtureProviderConfigGptOnly(providerId);
+  const rule = providerConfig.config.providerConfigRules.providerRules.find((r) => r.providerId === providerId);
+  rule.config.personalModelIds.push('my-custom-model', 'gpt-5.6-sol');
+  rule.config.modelOrder.push('my-custom-model', 'gpt-5.6-sol');
+  providerConfig.config.modelConfigRules.providerModelRules.push(
+    { providerId, modelId: 'my-custom-model', config: { properties: { contextWindow: 1 } } },
+    { providerId, modelId: 'gpt-5.6-sol', config: { properties: { contextWindow: 256000 } } },
+  );
+  const legacy = fixtureLegacyConfigGptOnly(providerId);
+  legacy.provider[providerId].models['my-custom-model'] = { limit: { context: 1, output: 1 } };
+  legacy.provider[providerId].models['gpt-5.6-sol'] = { limit: { context: 256000, output: 128000 } };
+  writeJson(p.providerConfig, providerConfig);
+  writeJson(p.legacyConfig, legacy);
+
+  const summary = runSetup({ home });
+
+  assert.equal(summary.removedModelIds.includes('gpt-5.6-sol'), true);
+  assert.equal(summary.removedModelIds.includes('my-custom-model'), false);
+  assert.equal(summary.removedProviderModelRuleIds.includes('my-custom-model'), false);
+  assert.equal(summary.removedLegacyModelIds.includes('my-custom-model'), false);
+  const after = gptOauthRule(readJson(p.providerConfig));
+  assert.equal(after.config.personalModelIds.includes('my-custom-model'), true);
+  assert.equal(after.config.personalModelIds.includes('gpt-5.6-sol'), false);
+  assert.equal(after.config.personalModelIds.includes('gpt-6-luna'), true);
+  assert.equal(
+    gptOauthModelRules(readJson(p.providerConfig), providerId).some((r) => r.modelId === 'my-custom-model'),
+    true,
+  );
+  assert.equal('my-custom-model' in legacyEntry(readJson(p.legacyConfig), providerId).models, true);
+  assert.equal('gpt-5.6-sol' in legacyEntry(readJson(p.legacyConfig), providerId).models, false);
 });

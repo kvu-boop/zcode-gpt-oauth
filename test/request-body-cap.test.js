@@ -35,8 +35,8 @@ function health(port) {
 }
 
 let fixture, backendPort, proxy;
-const BIG_BODY = JSON.stringify({ model: 'gpt-5.6-sol', messages: [{ role: 'user', content: 'x'.repeat(2000) }] });
-const SMALL_BODY = JSON.stringify({ model: 'gpt-5.6-sol', messages: [{ role: 'user', content: 'hi' }] });
+const BIG_BODY = JSON.stringify({ model: 'gpt-6-astra', messages: [{ role: 'user', content: 'x'.repeat(2000) }] });
+const SMALL_BODY = JSON.stringify({ model: 'gpt-6-astra', messages: [{ role: 'user', content: 'hi' }] });
 
 test.before(async () => {
   let upstreamCalls = 0;

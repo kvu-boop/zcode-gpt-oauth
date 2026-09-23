@@ -38,7 +38,7 @@ const { calculateAdditionalCacheMissCost } = require('./cache/cost');
 const { buildCacheNotice } = require('./cache/notice');
 const { createXaiAuth } = require('./xai-oauth');
 
-const VERSION = '0.3.3';
+const VERSION = '0.3.4';
 const NAME = 'gpt-oauth';
 
 // ---------------------------------------------------------------------------
@@ -111,13 +111,11 @@ const CACHE_MISS_NOTICES = ENV_CACHE_MISS_NOTICES === null ? PERSISTED_CACHE_MIS
 const OAUTH_PORT = 1455;
 const OAUTH_MAX_WAIT_MS = 5 * 60 * 1000;
 
-const MODEL_IDS = ['gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'];
+const MODEL_IDS = ['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna'];
 const MODEL_OWNED_BY = 'chatgpt-oauth';
 
-// Efforts accepted by the ChatGPT Codex backend for gpt-6-astra (matches
-// opencode v1.18.29 reasoning_options). Anything else is dropped so requests
-// without a valid effort keep the exact pre-astra wire format.
-const REASONING_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+// Efforts accepted by the ChatGPT Codex backend, including none. Anything else is dropped.
+const REASONING_EFFORTS = new Set(['none', 'low', 'medium', 'high', 'xhigh', 'max']);
 
 // Streaming (v0.2.2): bounds for the incremental SSE forwarder.
 function timeoutEnv(name, fallback) {
@@ -155,10 +153,7 @@ const xaiAuth = createXaiAuth({
   endpoints: { ...(XAI_DEVICE_URL ? { deviceAuthorizationUrl: XAI_DEVICE_URL } : {}), ...(XAI_TOKEN_URL ? { tokenUrl: XAI_TOKEN_URL } : {}) },
   logger: { warn: (message) => log(message), info: (message) => log(message) },
 });
-const XAI_MODEL_IDS = [
-  'grok-4.7', 'grok-4.6', 'grok-4.5', 'grok-4.3', 'grok-build-0.1',
-  'grok-4.20-0309-reasoning', 'grok-4.20-0309-non-reasoning',
-];
+const XAI_MODEL_IDS = ['grok-4.7', 'grok-4.6'];
 const ALL_MODEL_IDS = [...MODEL_IDS, ...XAI_MODEL_IDS];
 function providerForModel(model) {
   if (typeof model === 'string' && model.startsWith('grok-')) return 'xai';

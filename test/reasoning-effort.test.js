@@ -104,19 +104,28 @@ test('legacy/invalid reasoning_effort is dropped from the backend body', async (
 });
 
 test('no reasoning_effort keeps the pre-astra wire format', async () => {
-  const r = await post(proxy.port, JSON.stringify({ model: 'gpt-5.6-sol', messages: [{ role: 'user', content: 'hi' }] }));
+  const r = await post(proxy.port, JSON.stringify({ model: 'gpt-6-astra', messages: [{ role: 'user', content: 'hi' }] }));
   assert.equal(r.status, 200);
   const upstream = fixture.requests.at(-1);
   assert.equal('reasoning' in upstream, false);
   assert.equal('include' in upstream, false);
 });
 
-test('models list contains gpt-6-astra and the gpt-5.6 family', async () => {
+test('reasoning_effort none is forwarded for gpt-6-sol', async () => {
+  const r = await post(proxy.port, JSON.stringify({ model: 'gpt-6-sol', reasoning_effort: 'none', messages: [{ role: 'user', content: 'hi' }] }));
+  assert.equal(r.status, 200);
+  const upstream = fixture.requests.at(-1);
+  assert.equal(upstream.model, 'gpt-6-sol');
+  assert.deepEqual(upstream.reasoning, { effort: 'none', summary: 'auto' });
+  assert.deepEqual(upstream.include, ['reasoning.encrypted_content']);
+});
+
+test('models list contains the GPT-6 family and not gpt-5.6-sol', async () => {
   const r = await getModels(proxy.port);
   assert.equal(r.status, 200);
   const ids = JSON.parse(r.body).data.map((m) => m.id);
   assert.ok(ids.includes('gpt-6-astra'));
-  assert.ok(ids.includes('gpt-5.6-sol'));
-  assert.ok(ids.includes('gpt-5.6-terra'));
-  assert.ok(ids.includes('gpt-5.6-luna'));
+  assert.ok(ids.includes('gpt-6-sol'));
+  assert.ok(ids.includes('gpt-6-luna'));
+  assert.equal(ids.includes('gpt-5.6-sol'), false);
 });
